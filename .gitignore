@@ -22,3 +22,7 @@ Thumbs.db
 
 backend/credentials.json
 backend/token.json
+
+.env
+token.json
+credentials.json

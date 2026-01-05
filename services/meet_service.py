@@ -1,39 +1,61 @@
 import os
-from pathlib import Path
+import json
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from google.apps import meet_v2
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load environment variables
+backend_dir = Path(__file__).parent.parent
+env_path = backend_dir / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path, override=True)
+else:
+    load_dotenv()
 
 SCOPES = ['https://www.googleapis.com/auth/meetings.space.created']
 
 def create_meet_space():
     """
     Create a Google Meet space and return the meeting URI
+    Production-ready: Uses token from environment, refreshes if expired
     """
     creds = None
-    backend_dir = Path(__file__).parent.parent
-    token_path = backend_dir / "token.json"
-    credentials_path = backend_dir / "credentials.json"
     
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    # Load token from environment variable
+    token_json_str = os.getenv("GOOGLE_TOKEN_JSON")
+    if not token_json_str:
+        raise ValueError(
+            "GOOGLE_TOKEN_JSON not found in environment variables. "
+            "Please provide a valid Google OAuth token."
+        )
     
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+    try:
+        token_data = json.loads(token_json_str)
+        creds = Credentials.from_authorized_user_info(token_data, SCOPES)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise ValueError(f"Invalid GOOGLE_TOKEN_JSON format: {e}")
+    
+    # Refresh token if expired
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception as e:
+                raise RuntimeError(
+                    f"Token refresh failed: {e}. "
+                    "Please update GOOGLE_TOKEN_JSON with a new token."
+                )
         else:
-            if not credentials_path.exists():
-                raise FileNotFoundError("credentials.json not found. Please set up Google OAuth credentials.")
-            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-        
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
+            raise ValueError(
+                "Token is invalid and cannot be refreshed. "
+                "Please update GOOGLE_TOKEN_JSON with a valid token."
+            )
     
+    # Create Meet space
     client = meet_v2.SpacesServiceClient(credentials=creds)
     request = meet_v2.CreateSpaceRequest()
     response = client.create_space(request=request)
     
     return response.meeting_uri
-
