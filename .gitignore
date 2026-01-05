@@ -1,0 +1,24 @@
+# Dependencies & builds
+node_modules/
+frontend/build/
+backend/static/uploads/
+
+# Caches
+__pycache__/
+*.pyc
+
+# Env/secrets
+.env
+.env.local
+.env.*.local
+
+# Archives/unneeded
+deleted_files/
+auth-backend/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+backend/credentials.json
+backend/token.json
