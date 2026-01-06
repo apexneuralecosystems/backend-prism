@@ -2066,7 +2066,7 @@ async def send_interview_form(
         
         # Get frontend URL from environment
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        
+        frontend_url = frontend_url.rstrip('/')
         # Check candidate's current status
         applicant_doc = await job_applied_collection.find_one({
             "job_id": request.job_id,
@@ -2483,6 +2483,7 @@ async def submit_interview_form(request: SubmitInterviewFormRequest):
         # Create feedback form webhook ID first (needed for email)
         feedback_webhook_id = str(uuid.uuid4())
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = frontend_url.rstrip('/')
         feedback_form_link = f"{frontend_url}/interview-feedback?feedback_id={feedback_webhook_id}&webhook_id={request.webhook_id}"
         
         # Store feedback webhook mapping
@@ -2994,6 +2995,7 @@ async def send_offer_letter(
         # Create webhook ID for offer response
         webhook_id = str(uuid.uuid4())
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = frontend_url.rstrip('/') 
         form_link = f"{frontend_url}/offer-response?offer_id={webhook_id}"
         
         # Store offer webhook
