@@ -76,7 +76,7 @@ app = FastAPI(
 )
 
 # CORS - Configurable via environment variable
-CORS_ORIGINS_STR = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173")
+CORS_ORIGINS_STR = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173,http://localhost:5173,https://prism.apexneural.cloud")
 CORS_ORIGINS = [origin.strip() for origin in CORS_ORIGINS_STR.split(",") if origin.strip()]
 print(f"🔍 CORS allowed origins: {CORS_ORIGINS}")
 
@@ -3208,4 +3208,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5555)
