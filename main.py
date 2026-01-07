@@ -67,6 +67,7 @@ refresh_tokens_collection = db["refresh_tokens"]
 interview_webhook_collection = db["interview_webhooks"]
 interview_feedback_collection = db["interview-feedback"]
 offer_webhook_collection = db["offer_webhooks"]
+review_requests_collection = db["review_requests"]
 
 # FastAPI app
 app = FastAPI(
@@ -1080,7 +1081,7 @@ async def update_applicant_status(
             )
 
         new_status = status_data.get("status")
-        valid_statuses = ["applied", "decision_pending", "selected_for_interview", "rejected", "selected", "processing", "invitation_sent"]
+        valid_statuses = ["applied", "decision_pending", "decision_pending_review", "selected_for_interview", "rejected", "selected", "processing", "invitation_sent", "offer_sent", "offer_accepted"]
         if not new_status or new_status not in valid_statuses:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1479,6 +1480,8 @@ async def apply_for_job(
             resume_url = user_profile.get("resumeUrl", "") or user_profile.get("resume_url", "")
         
         print(f"📄 [APPLY] Resume URL for {current_user['email']}: {resume_url}")
+
+        user_additional_details = (application_data.get("additional_details") or "").strip()
         
         if not resume_url:
             raise HTTPException(
@@ -1598,6 +1601,13 @@ async def apply_for_job(
                 print(f"❌ [APPLY] Error running comparator agent: {e}")
                 import traceback
                 traceback.print_exc()
+
+        combined_details = ""
+        if user_additional_details:
+            combined_details = f"Candidate provided details:\n{user_additional_details}"
+        if additional_details:
+            combined_details = f"{combined_details}\n\nAI assessment:\n{additional_details}" if combined_details else additional_details
+        candidate_data["additional_details"] = combined_details
         
         # Add candidate to applied_candidates array in open-jobs collection
         result = await open_jobs_collection.update_one(
@@ -1618,7 +1628,7 @@ async def apply_for_job(
             "email": current_user["email"],
             "resume_url": resume_url,
             "status": "applied",
-            "additional_details": additional_details,
+            "additional_details": combined_details,
             "applied_at": datetime.utcnow()
         }
 
@@ -2644,6 +2654,7 @@ class InterviewFeedbackRequest(BaseModel):
     enthusiasm: int  # 1-5
     teamwork: int  # 1-5
     attitude: int  # 1-5
+    comments: str = ""  # Optional comments
     interview_outcome: str  # "selected", "proceed", "rejected"
 
 @app.post("/api/submit-interview-feedback")
@@ -2796,6 +2807,8 @@ async def submit_interview_feedback(request: InterviewFeedbackRequest):
             
             round_details["scores"] = scores
             round_details["interview_outcome"] = request.interview_outcome
+            if request.comments:
+                round_details["comments"] = request.comments
             
             if request.interview_outcome == "rejected":
                 # Rejected - move to previous_rounds, update status
@@ -2891,6 +2904,7 @@ async def submit_interview_feedback(request: InterviewFeedbackRequest):
                         "enthusiasm": request.enthusiasm,
                         "teamwork": request.teamwork,
                         "attitude": request.attitude,
+                        "comments": request.comments or "",
                         "interview_outcome": request.interview_outcome
                     }
                 }
@@ -3206,6 +3220,485 @@ async def health_check():
             "database": str(e),
             "timestamp": datetime.utcnow().isoformat()
         }
+
+
+@app.post("/api/review-request")
+async def create_review_request(
+    data: Dict[str, Any] = Body(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Create a decision review request and email a reviewer.
+    """
+    try:
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can request reviews"
+            )
+
+        job_id = data.get("job_id")
+        applicant_email = data.get("applicant_email")
+        applicant_name = data.get("applicant_name")
+        reviewer_email = data.get("reviewer_email")
+        resume_url = data.get("resume_url", "")
+        additional_details = data.get("additional_details", "")
+
+        if not (job_id and applicant_email and applicant_name and reviewer_email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing required fields"
+            )
+
+        review_id = str(uuid.uuid4())
+
+        review_doc = {
+            "review_id": review_id,
+            "job_id": job_id,
+            "applicant_email": applicant_email,
+            "applicant_name": applicant_name,
+            "reviewer_email": reviewer_email,
+            "resume_url": resume_url,
+            "additional_details": additional_details,
+            "status": "pending",
+            "created_at": datetime.utcnow()
+        }
+
+        await review_requests_collection.insert_one(review_doc)
+
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = frontend_url.rstrip('/')
+        review_link = f"{frontend_url}/review-form?review_id={review_id}"
+
+        # Get backend base URL for resume link
+        backend_base = os.getenv("BACKEND_BASE_URL", "http://localhost:5555")
+        # Normalize resume_url - it might already have /static/ or might not
+        normalized_resume_url = resume_url
+        if resume_url:
+            # Remove leading /static/ if present, then add it back for consistency
+            normalized_resume_url = resume_url.lstrip("/static/")
+            normalized_resume_url = f"/static/{normalized_resume_url}"
+        resume_link = f"{backend_base}{normalized_resume_url}" if resume_url else "Not available"
+        
+        # Get resume file path for attachment
+        resume_file_path = None
+        resume_file_name = None
+        if resume_url:
+            try:
+                # Remove /static/ prefix to get relative path from static_dir
+                resume_relative_path = resume_url.lstrip("/static/")
+                resume_path = static_dir / resume_relative_path
+                if resume_path.exists():
+                    resume_file_path = str(resume_path)
+                    # Get file extension from original file
+                    file_ext = resume_path.suffix if resume_path.suffix else ".pdf"
+                    resume_file_name = f"{applicant_name.replace(' ', '_')}_Resume{file_ext}"
+                    print(f"✅ Resume file found for attachment: {resume_file_path}")
+                else:
+                    print(f"⚠️ Resume file not found at: {resume_path}")
+            except Exception as e:
+                print(f"⚠️ Error getting resume file path: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Create professional HTML email template
+        from services.email_service import send_email_with_attachment
+        from_email = os.getenv("FROM_EMAIL") or os.getenv("FROM_email")
+        password = os.getenv("EMAIL_PASSWORD")
+        
+        html_body = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6; 
+            color: #111827;
+            background: linear-gradient(135deg, #facc15 0%, #eab308 100%);
+            margin: 0;
+            padding: 40px 20px;
+        }}
+        .container {{ 
+            max-width: 640px; 
+            margin: 0 auto; 
+            background: #ffffff;
+            border-radius: 20px;
+            overflow: hidden;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }}
+        .header {{ 
+            background: linear-gradient(135deg, #facc15 0%, #eab308 100%);
+            color: white; 
+            padding: 40px 32px; 
+            text-align: center;
+        }}
+        .header-icon {{
+            width: 80px;
+            height: 80px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 20px;
+            font-size: 42px;
+            backdrop-filter: blur(10px);
+        }}
+        .header h2 {{
+            margin: 0;
+            font-size: 28px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+        }}
+        .header p {{
+            margin: 8px 0 0 0;
+            font-size: 15px;
+            opacity: 0.95;
+            font-weight: 500;
+        }}
+        .content {{ 
+            background: #ffffff; 
+            padding: 36px 32px;
+        }}
+        .content p {{
+            margin: 0 0 16px 0;
+            font-size: 15px;
+            line-height: 1.7;
+            color: #4b5563;
+        }}
+        .content p.greeting {{
+            font-size: 16px;
+            font-weight: 600;
+            color: #111827;
+            margin-bottom: 20px;
+        }}
+        .details-box {{
+            background: linear-gradient(to bottom right, #fef9c3, #fef08a);
+            padding: 24px;
+            border-radius: 16px;
+            margin: 28px 0;
+            border: 2px solid #facc15;
+            box-shadow: 0 4px 12px rgba(250, 204, 21, 0.15);
+        }}
+        .details-box h3 {{
+            margin: 0 0 16px 0;
+            font-size: 18px;
+            font-weight: 700;
+            color: #b45309;
+        }}
+        .details-box p {{
+            margin: 10px 0;
+            font-size: 14px;
+            color: #1f2937;
+        }}
+        .details-box strong {{
+            font-weight: 700;
+            color: #111827;
+            min-width: 140px;
+            display: inline-block;
+        }}
+        .button {{ 
+            display: inline-block; 
+            padding: 18px 40px; 
+            background: linear-gradient(135deg, #facc15 0%, #eab308 100%);
+            color: #1f2937; 
+            text-decoration: none; 
+            border-radius: 14px; 
+            margin: 24px 0;
+            font-weight: 700;
+            font-size: 16px;
+            box-shadow: 0 8px 24px rgba(250, 204, 21, 0.4);
+            transition: all 0.3s;
+            text-align: center;
+            letter-spacing: 0.3px;
+        }}
+        .button:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 10px 28px rgba(250, 204, 21, 0.5);
+        }}
+        .info-note {{
+            background: linear-gradient(to right, #dbeafe, #e0e7ff);
+            border-left: 4px solid #3b82f6;
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin: 24px 0;
+        }}
+        .info-note p {{
+            margin: 0;
+            color: #1e40af;
+            font-weight: 500;
+            font-size: 14px;
+        }}
+        .link-box {{
+            background: #f9fafb;
+            border: 2px dashed #cbd5e1;
+            padding: 16px 20px;
+            border-radius: 12px;
+            margin: 20px 0;
+            word-break: break-all;
+        }}
+        .link-box p {{
+            margin: 0;
+            color: #facc15;
+            font-size: 13px;
+            font-weight: 600;
+            text-align: center;
+        }}
+        .footer {{ 
+            text-align: center;
+            background: linear-gradient(to bottom, #f9fafb, #f3f4f6);
+            padding: 24px 32px;
+            border-top: 2px solid #e5e7eb;
+        }}
+        .footer p {{
+            margin: 6px 0;
+            color: #6b7280;
+            font-size: 13px;
+        }}
+        a {{
+            color: #2563eb;
+            text-decoration: none;
+            font-weight: 600;
+        }}
+        a:hover {{
+            text-decoration: underline;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-icon">📋</div>
+            <h2>Candidate Review Request</h2>
+            <p>Your decision is needed</p>
+        </div>
+        <div class="content">
+            <p class="greeting">👋 Hello,</p>
+            <p>You have been asked to review a candidate for a position. Please review the candidate's profile and provide your decision.</p>
+            <div class="details-box">
+                <h3>📋 Candidate Information</h3>
+                <p><strong>👤 Name:</strong> {applicant_name}</p>
+                <p><strong>📧 Email:</strong> <a href="mailto:{applicant_email}">{applicant_email}</a></p>
+                <p><strong>📄 Resume:</strong> <a href="{resume_link}" target="_blank">View Resume →</a></p>
+            </div>
+            {f'<div class="details-box" style="background: linear-gradient(to bottom right, #f0f9ff, #e0f2fe); border-color: #3b82f6;"><h3 style="color: #1e40af;">📝 Additional Details</h3><div style="font-size: 13px; line-height: 1.6; color: #475569; white-space: pre-wrap;">{additional_details}</div></div>' if additional_details else ''}
+            <div class="info-note">
+                <p>📌 Please review the candidate's profile and submit your decision using the button below.</p>
+            </div>
+            <div style="text-align: center; margin: 32px 0;">
+                <a href="{review_link}" class="button">📋 Submit Review Decision</a>
+            </div>
+            <p style="text-align: center; color: #6b7280; font-size: 14px; margin: 20px 0;">If the button doesn't work, copy and paste this link into your browser:</p>
+            <div class="link-box">
+                <p>{review_link}</p>
+            </div>
+            <p style="margin-top: 32px; padding-top: 24px; border-top: 2px solid #e5e7eb;">
+                <strong>Best regards,</strong><br>
+                <strong style="color: #facc15; font-size: 16px;">PRISM Recruiting Team</strong>
+            </p>
+        </div>
+        <div class="footer">
+            <p><strong>© 2024 PRISM</strong> - APEXNEURAL</p>
+            <p>This is an automated message. Please do not reply to this email.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+        
+        # Build plain text email (avoiding backslashes in f-string expressions)
+        additional_details_text = ""
+        if additional_details:
+            additional_details_text = f"\nAdditional Details:\n{additional_details}\n"
+        
+        plain_text = f"""Candidate Review Request
+
+Hello,
+
+You have been asked to review a candidate for a position.
+
+Candidate Information:
+Name: {applicant_name}
+Email: {applicant_email}
+Resume: {resume_link}
+{additional_details_text}Please submit your decision (Selected / Rejected / Interview) here:
+{review_link}
+
+Best regards,
+PRISM Recruiting Team
+"""
+        
+        if not from_email or not password:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Email service not configured"
+            )
+        
+        # Send email with resume attachment if available
+        if resume_file_path and resume_file_name:
+            email_sent = send_email_with_attachment(
+                to_email=reviewer_email,
+                subject=f"Review Request - {applicant_name}",
+                html_content=html_body,
+                attachment_path=resume_file_path,
+                attachment_name=resume_file_name
+            )
+        else:
+            # Fallback to send_mail if no resume file
+            from services.email_service import send_mail
+            email_sent = send_mail(
+                to_emails=reviewer_email,
+                subject=f"Review Request - {applicant_name}",
+                message=plain_text,
+                password=password,
+                from_email=from_email,
+                html_content=html_body
+            )
+        
+        if not email_sent:
+            print(f"⚠️ Warning: Failed to send review request email to {reviewer_email}")
+        else:
+            print(f"✅ Review request email sent successfully to {reviewer_email}")
+
+        return {"success": True, "review_id": review_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error creating review request: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/api/review-request/{review_id}")
+async def get_review_request(review_id: str):
+    """
+    Get review request data by review_id (public endpoint for reviewers)
+    """
+    try:
+        review_doc = await review_requests_collection.find_one({"review_id": review_id})
+        
+        if not review_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Review request not found"
+            )
+        
+        # Check if already submitted
+        if review_doc.get("status") != "pending":
+            return {
+                "success": True,
+                "review_id": review_doc.get("review_id"),
+                "applicant_name": review_doc.get("applicant_name"),
+                "applicant_email": review_doc.get("applicant_email"),
+                "resume_url": review_doc.get("resume_url", ""),
+                "additional_details": review_doc.get("additional_details", ""),
+                "status": review_doc.get("status"),
+                "submitted_at": review_doc.get("submitted_at"),
+                "already_submitted": True
+            }
+        
+        return {
+            "success": True,
+            "review_id": review_doc.get("review_id"),
+            "applicant_name": review_doc.get("applicant_name"),
+            "applicant_email": review_doc.get("applicant_email"),
+            "resume_url": review_doc.get("resume_url", ""),
+            "additional_details": review_doc.get("additional_details", ""),
+            "status": review_doc.get("status"),
+            "already_submitted": False
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching review request: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.post("/api/review-form/{review_id}")
+async def submit_review_decision(
+    review_id: str,
+    body: Dict[str, Any] = Body(...)
+):
+    """
+    Submit review decision (Selected / Rejected / Interview)
+    Updates applicant status in job-applied and open-jobs collections
+    """
+    try:
+        decision = body.get("decision")
+        
+        if decision not in ["selected", "rejected", "selected_for_interview"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid decision. Must be one of: selected, rejected, selected_for_interview"
+            )
+        
+        # Find review request
+        review_doc = await review_requests_collection.find_one({"review_id": review_id})
+        
+        if not review_doc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Review request not found"
+            )
+        
+        # Check if already submitted
+        if review_doc.get("status") != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Review decision has already been submitted"
+            )
+        
+        job_id = review_doc.get("job_id")
+        applicant_email = review_doc.get("applicant_email")
+        
+        # Update review request status
+        await review_requests_collection.update_one(
+            {"review_id": review_id},
+            {
+                "$set": {
+                    "status": decision,
+                    "submitted_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Update applicant status in job-applied collection
+        await job_applied_collection.update_one(
+            {"job_id": job_id, "email": applicant_email},
+            {"$set": {"status": decision}}
+        )
+        
+        # Update applicant status in open-jobs collection (applied_candidates array)
+        await open_jobs_collection.update_one(
+            {"job_id": job_id, "applied_candidates.email": applicant_email},
+            {"$set": {"applied_candidates.$.status": decision}}
+        )
+        
+        print(f"✅ Review decision submitted: {decision} for {applicant_email} (job: {job_id})")
+        
+        return {
+            "success": True,
+            "message": "Review decision submitted successfully",
+            "decision": decision
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error submitting review decision: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
 
 if __name__ == "__main__":

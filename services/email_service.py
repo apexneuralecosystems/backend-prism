@@ -2287,3 +2287,36 @@ This is an automated message. Please do not reply to this email.
         import traceback
         traceback.print_exc()
         return False
+
+
+async def send_generic_email(to_email: str, subject: str, body: str) -> bool:
+    """
+    Send a generic email with plain text body
+    
+    Args:
+        to_email: Recipient email address
+        subject: Email subject
+        body: Plain text email body
+        
+    Returns:
+        bool: True if email sent successfully, False otherwise
+    """
+    try:
+        from_email = os.getenv("FROM_EMAIL") or os.getenv("FROM_email")
+        password = os.getenv("EMAIL_PASSWORD")
+        
+        if not from_email or not password:
+            print(f"❌ Email credentials not found")
+            return False
+        
+        return send_mail(
+            to_emails=to_email,
+            subject=subject,
+            message=body,
+            password=password,
+            from_email=from_email,
+            html_content=None
+        )
+    except Exception as e:
+        print(f"❌ Error sending generic email: {e}")
+        return False
