@@ -1,4 +1,5 @@
 import smtplib
+import socket
 import os
 from pathlib import Path
 from email.message import EmailMessage
@@ -89,21 +90,44 @@ def send_mail(
             html_part = MIMEText(html_content, 'html')
             msg.attach(html_part)
 
-        # Connect to SMTP server
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()  # Secure the connection
-        server.login(from_email, password)
-        server.send_message(msg)
-        server.quit()
+        # Connect to SMTP server with timeout
+        socket.setdefaulttimeout(10)  # 10 second timeout for connection
+        
+        try:
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+            server.starttls()  # Secure the connection
+            server.login(from_email, password)
+            server.send_message(msg)
+            server.quit()
+        except socket.gaierror as e:
+            # DNS resolution failed - check if it's a network issue
+            print(f"❌ DNS resolution failed for {smtp_server}. This might be a network connectivity issue.")
+            print(f"   Check your internet connection and DNS settings.")
+            raise
 
         print('✅ Successfully sent the email.')
         return True
+    except socket.timeout:
+        print(f"❌ Email sending timeout: Could not connect to SMTP server {smtp_server}")
+        return False
+    except socket.gaierror as e:
+        print(f"❌ Email DNS error: Could not resolve SMTP server {smtp_server}. Error: {e}")
+        print(f"   This usually means:")
+        print(f"   1. No internet connection")
+        print(f"   2. DNS server is not reachable")
+        print(f"   3. Firewall is blocking DNS queries")
+        print(f"   4. SMTP server hostname is incorrect")
+        print(f"   Please check your network settings and DNS configuration.")
+        return False
     except smtplib.SMTPException as e:
-        print(f"❌ Error sending email: {e}")
+        print(f"❌ SMTP error sending email: {e}")
         return False
     except Exception as e:
         print(f"❌ Unexpected error sending email: {e}")
         return False
+    finally:
+        # Reset timeout
+        socket.setdefaulttimeout(None)
 
 
 def get_email_template():
@@ -2320,3 +2344,112 @@ async def send_generic_email(to_email: str, subject: str, body: str) -> bool:
     except Exception as e:
         print(f"❌ Error sending generic email: {e}")
         return False
+
+
+async def send_member_invitation_email(member_email: str, member_name: str, org_name: str, invite_link: str):
+    """
+    Send organization member invitation email
+    """
+    from_email = os.getenv("FROM_EMAIL")
+    password = os.getenv("EMAIL_PASSWORD")
+    
+    if not from_email or not password:
+        print("❌ Email credentials not configured")
+        return False
+    
+    subject = f"You've been invited to join {org_name} on PRISM"
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                color: #333;
+            }}
+            .container {{
+                max-width: 600px;
+                margin: 0 auto;
+                padding: 20px;
+                background: #f9f9f9;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                text-align: center;
+                border-radius: 10px 10px 0 0;
+            }}
+            .content {{
+                background: white;
+                padding: 30px;
+                border-radius: 0 0 10px 10px;
+            }}
+            .button {{
+                display: inline-block;
+                padding: 12px 30px;
+                background: #667eea;
+                color: white;
+                text-decoration: none;
+                border-radius: 5px;
+                margin: 20px 0;
+            }}
+            .footer {{
+                text-align: center;
+                margin-top: 20px;
+                color: #666;
+                font-size: 12px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>Organization Invitation</h1>
+            </div>
+            <div class="content">
+                <p>Hello {member_name},</p>
+                <p>You have been invited to join <strong>{org_name}</strong> as a team member on PRISM.</p>
+                <p>As a team member, you will be able to:</p>
+                <ul>
+                    <li>Post and manage your own job postings</li>
+                    <li>Manage applicants for your jobs</li>
+                    <li>Create and manage interview teams</li>
+                    <li>View organization analytics</li>
+                </ul>
+                <p>Click the button below to accept or reject this invitation:</p>
+                <div style="text-align: center;">
+                    <a href="{invite_link}" class="button">Respond to Invitation</a>
+                </div>
+                <p style="margin-top: 20px; font-size: 12px; color: #666;">
+                    If the button doesn't work, copy and paste this link into your browser:<br>
+                    {invite_link}
+                </p>
+            </div>
+            <div class="footer">
+                <p>This invitation was sent by {org_name}</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    
+    message = f"""
+    Hello {member_name},
+    
+    You have been invited to join {org_name} as a team member on PRISM.
+    
+    Click this link to respond: {invite_link}
+    """
+    
+    return send_mail(
+        to_emails=member_email,
+        subject=subject,
+        message=message,
+        password=password,
+        from_email=from_email,
+        html_content=html_content
+    )

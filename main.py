@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Body, Depends, status, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, Body, Depends, status, File, UploadFile, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -59,6 +59,7 @@ users_collection = db["users"]
 user_data_collection = db["user_data"]
 organization_data_collection = db["organization_data"]
 organization_teams_collection = db["organization_teams"]
+organization_members_collection = db["organization_members"]
 open_jobs_collection = db["open-jobs"]
 ongoing_jobs_collection = db["ongoing-jobs"]
 closed_jobs_collection = db["closed-jobs"]
@@ -115,7 +116,7 @@ class DemoRequest(BaseModel):
 # ==================== HELPER FUNCTIONS ====================
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token and get current user"""
+    """Verify JWT token and get current user with org member info"""
     token = credentials.credentials
     payload = verify_token(token, "access")
     
@@ -139,13 +140,57 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="User not found"
         )
     
+    # Check if this is an org member
+    member_info = await organization_members_collection.find_one({
+        "member_email": email,
+        "status": "accepted"
+    })
+    
+    # Enhance user dict with member info
+    if member_info:
+        user["org_email"] = member_info["org_email"]
+        user["role"] = member_info["role"]
+        user["is_org_member"] = True
+    else:
+        # This is the owner/main account
+        user["org_email"] = email  # Owner's email is the org email
+        user["role"] = "owner"
+        user["is_org_member"] = False
+    
     return user
+
+
+# ==================== PERMISSION HELPER FUNCTIONS ====================
+
+def is_org_owner(current_user: dict) -> bool:
+    """Check if user is organization owner"""
+    return current_user.get("role") == "owner" and not current_user.get("is_org_member", False)
+
+def is_org_member(current_user: dict) -> bool:
+    """Check if user is organization member"""
+    return current_user.get("is_org_member", False)
+
+def get_org_email(current_user: dict) -> str:
+    """Get organization email (owner's email)"""
+    return current_user.get("org_email") or current_user.get("email")
+
+def can_edit_job(job: dict, current_user: dict) -> bool:
+    """Check if user can edit a specific job"""
+    # Owner can edit all jobs in their org
+    if is_org_owner(current_user):
+        return job.get("company", {}).get("email") == get_org_email(current_user)
+    
+    # Member can only edit jobs they created
+    if is_org_member(current_user):
+        return job.get("created_by") == current_user.get("email")
+    
+    return False
 
 
 # ==================== AUTHENTICATION ENDPOINTS ====================
 
 @app.post("/api/auth/signup", status_code=status.HTTP_200_OK)
-async def signup(user_data: UserSignup):
+async def signup(user_data: UserSignup, background_tasks: BackgroundTasks):
     """
     User/Organization Signup - Send OTP to email
     
@@ -153,25 +198,28 @@ async def signup(user_data: UserSignup):
     after successful OTP verification in /api/auth/verify-otp endpoint.
     """
     try:
-        # Check if user already exists
+        # Check if user already exists with ANY user_type (one email = one account)
         existing_user = await users_collection.find_one({
-            "email": user_data.email,
-            "user_type": user_data.user_type
+            "email": user_data.email
         })
         
         if existing_user:
+            existing_type = existing_user.get("user_type", "user")
+            print(f"❌ [SIGNUP] Duplicate email detected: {user_data.email} already registered as {existing_type}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{user_data.user_type.capitalize()} already exists with this email"
+                detail=f"Email already registered as {existing_type}. Each email can only have one account type."
             )
+        
+        print(f"✅ [SIGNUP] Email {user_data.email} is available for {user_data.user_type} signup")
         
         # Generate and store OTP (NO account creation here)
         otp = generate_otp()
         await store_otp(db, user_data.email, otp)
         
-        # Send OTP email
+        # Send OTP email in background (non-blocking)
         from services.email_service import send_otp_email
-        await send_otp_email(user_data.email, otp, "signup")
+        background_tasks.add_task(send_otp_email, user_data.email, otp, "signup")
         
         return {
             "success": True,
@@ -230,17 +278,20 @@ async def verify_otp_and_create_user(data: dict = Body(...)):
         
         # ===== Only proceed with account creation if OTP verification was successful =====
         
-        # Check if user already exists (in case of race condition or duplicate signup)
+        # Check if user already exists with ANY user_type (one email = one account)
         existing_user = await users_collection.find_one({
-            "email": email,
-            "user_type": user_type
+            "email": email
         })
         
         if existing_user:
+            existing_type = existing_user.get("user_type", "user")
+            print(f"❌ [VERIFY-OTP] Duplicate email detected: {email} already registered as {existing_type}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{user_type.capitalize()} account already exists with this email"
+                detail=f"Email already registered as {existing_type}. Each email can only have one account type."
             )
+        
+        print(f"✅ [VERIFY-OTP] Email {email} is available, proceeding with {user_type} account creation")
         
         # Only after successful OTP verification, proceed with account creation
         # Hash password
@@ -357,8 +408,27 @@ async def login(login_data: UserLogin):
                 detail="Invalid email or password"
             )
         
-        # Generate tokens
-        token_data = {"sub": login_data.email, "user_type": login_data.user_type}
+        # Check if this is an org member
+        member_info = await organization_members_collection.find_one({
+            "member_email": login_data.email,
+            "status": "accepted"
+        })
+        
+        # Generate tokens with member info
+        if member_info:
+            token_data = {
+                "sub": login_data.email,
+                "user_type": login_data.user_type,
+                "org_email": member_info["org_email"],
+                "role": member_info["role"],
+                "is_org_member": True
+            }
+        else:
+            token_data = {
+                "sub": login_data.email,
+                "user_type": login_data.user_type
+            }
+        
         access_token = create_access_token(token_data)
         refresh_token = create_refresh_token(token_data)
         
@@ -369,15 +439,24 @@ async def login(login_data: UserLogin):
             "created_at": datetime.utcnow()
         })
         
+        # Prepare user response
+        user_response = {
+            "id": str(user["_id"]),
+            "email": user["email"],
+            "name": user["name"],
+            "user_type": user["user_type"]
+        }
+        
+        # Add member info if applicable
+        if member_info:
+            user_response["org_email"] = member_info["org_email"]
+            user_response["role"] = member_info["role"]
+            user_response["is_org_member"] = True
+        
         return TokenResponse(
             access_token=access_token,
             refresh_token=refresh_token,
-            user={
-                "id": str(user["_id"]),
-                "email": user["email"],
-                "name": user["name"],
-                "user_type": user["user_type"]
-            }
+            user=user_response
         )
     
     except HTTPException:
@@ -416,11 +495,21 @@ async def refresh_access_token(token_request: RefreshTokenRequest):
                 detail="Refresh token not found"
             )
         
-        # Generate new access token
+        # Generate new access token with all original payload data
+        # Preserve org_email, role, and is_org_member for members
         token_data = {
             "sub": payload.get("sub"),
             "user_type": payload.get("user_type")
         }
+        
+        # Preserve member info if present in original token
+        if payload.get("org_email"):
+            token_data["org_email"] = payload.get("org_email")
+        if payload.get("role"):
+            token_data["role"] = payload.get("role")
+        if payload.get("is_org_member"):
+            token_data["is_org_member"] = payload.get("is_org_member")
+        
         access_token = create_access_token(token_data)
         
         return {
@@ -756,12 +845,22 @@ async def create_organization_profile(
                 detail="Only organizations can access this endpoint"
             )
         
+        # Check if user is owner (members cannot edit profile)
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can edit the profile. Members can view but not modify."
+            )
+        
+        # Get org email (for consistency, use get_org_email)
+        org_email = get_org_email(current_user)
+        
         # Remove _id if it exists
         if "_id" in profile_data:
             profile_data.pop("_id")
 
         # Update organization data by email
-        profile_data["email"] = current_user["email"]
+        profile_data["email"] = org_email
         profile_data["updated_at"] = datetime.utcnow()
         
         # Ensure employees_details is an array if provided
@@ -770,7 +869,7 @@ async def create_organization_profile(
         
         # Update existing document or create if not exists
         result = await organization_data_collection.update_one(
-            {"email": current_user["email"]},
+            {"email": org_email},
             {"$set": profile_data},
             upsert=True
         )
@@ -794,6 +893,7 @@ async def create_organization_profile(
 async def get_organization_profile(current_user: dict = Depends(get_current_user)):
     """
     Get organization's profile data (Protected)
+    Members see the organization's profile (not their own)
     """
     try:
         # Verify user is an organization
@@ -803,8 +903,11 @@ async def get_organization_profile(current_user: dict = Depends(get_current_user
                 detail="Only organizations can access this endpoint"
             )
         
+        # Get org email (for members, this is their org_email, for owners it's their email)
+        org_email = get_org_email(current_user)
+        
         profile = await organization_data_collection.find_one({
-            "email": current_user["email"]
+            "email": org_email
         })
         
         if not profile:
@@ -844,6 +947,581 @@ async def get_organization_profile(current_user: dict = Depends(get_current_user
         )
 
 
+# ==================== ORGANIZATION MEMBERS ENDPOINTS ====================
+
+class InviteMemberRequest(BaseModel):
+    name: str
+    email: EmailStr
+
+class BulkInviteMemberRequest(BaseModel):
+    members: list[InviteMemberRequest]
+
+@app.post("/api/organization/invite-member")
+async def invite_member(
+    request: InviteMemberRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Invite a new member to the organization (Owner only)
+    """
+    try:
+        # Verify user is an organization
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+        
+        # Check if user is owner
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can invite members"
+            )
+        
+        org_email = current_user["email"]
+        
+        print(f"🔍 [INVITE-MEMBER] Owner: {org_email}, Inviting: {request.email}")
+        
+        # Check if member already exists
+        existing_member = await organization_members_collection.find_one({
+            "org_email": org_email,
+            "member_email": request.email
+        })
+        
+        if existing_member:
+            member_status = existing_member.get("status", "unknown")
+            print(f"❌ [INVITE-MEMBER] Member already exists with status: {member_status}")
+            if member_status == "accepted":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="This email is already a member of your organization"
+                )
+            elif member_status == "pending":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="An invitation has already been sent to this email"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Member exists with status: {member_status}"
+                )
+        
+        # Check if email already has ANY account (user or organization)
+        existing_user = await users_collection.find_one({
+            "email": request.email
+        })
+        
+        if existing_user:
+            existing_type = existing_user.get("user_type", "user")
+            print(f"❌ [INVITE-MEMBER] Email already registered as: {existing_type}")
+            if existing_user.get("email") == org_email:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot invite yourself"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"This email is already registered as {existing_type}. Cannot invite an email that already has an account."
+                )
+        
+        print(f"✅ [INVITE-MEMBER] Email {request.email} is available for invitation")
+        
+        # Generate unique invite token
+        invite_token = str(uuid.uuid4())
+        
+        # Get organization name
+        org_data = await organization_data_collection.find_one({"email": org_email})
+        org_name = org_data.get("name", org_email) if org_data else org_email
+        
+        # Create member record
+        member_doc = {
+            "org_email": org_email,
+            "member_email": request.email,
+            "member_name": request.name,
+            "role": "member",
+            "status": "pending",
+            "invite_token": invite_token,
+            "invited_by": org_email,
+            "invited_at": datetime.utcnow(),
+            "accepted_at": None,
+            "password_hash": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        await organization_members_collection.insert_one(member_doc)
+        
+        # Send invitation email in background (non-blocking)
+        from services.email_service import send_member_invitation_email
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        invite_link = f"{frontend_url}/invite-accept/{invite_token}"
+        
+        background_tasks.add_task(
+            send_member_invitation_email,
+            request.email,
+            request.name,
+            org_name,
+            invite_link
+        )
+        
+        print(f"✅ [POST /api/organization/invite-member] Invitation created for {request.email}")
+        
+        return {
+            "success": True,
+            "message": "Invitation sent successfully"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error inviting member: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error inviting member: {str(e)}"
+        )
+
+
+@app.post("/api/organization/invite-members-bulk")
+async def invite_members_bulk(
+    request: BulkInviteMemberRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Invite multiple members to the organization at once (Owner only)
+    """
+    try:
+        # Verify user is an organization
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+        
+        # Check if user is owner
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can invite members"
+            )
+        
+        org_email = current_user["email"]
+        
+        # Get organization name
+        org_data = await organization_data_collection.find_one({"email": org_email})
+        org_name = org_data.get("name", org_email) if org_data else org_email
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        
+        results = {
+            "success": [],
+            "failed": []
+        }
+        
+        for member_data in request.members:
+            try:
+                # Check if member already exists
+                existing_member = await organization_members_collection.find_one({
+                    "org_email": org_email,
+                    "member_email": member_data.email
+                })
+                
+                if existing_member:
+                    if existing_member.get("status") == "accepted":
+                        results["failed"].append({
+                            "email": member_data.email,
+                            "reason": "Already a member"
+                        })
+                        continue
+                    elif existing_member.get("status") == "pending":
+                        results["failed"].append({
+                            "email": member_data.email,
+                            "reason": "Invitation already sent"
+                        })
+                        continue
+                
+                # Check if email already has ANY account
+                existing_user = await users_collection.find_one({
+                    "email": member_data.email
+                })
+                
+                if existing_user:
+                    if existing_user.get("email") == org_email:
+                        results["failed"].append({
+                            "email": member_data.email,
+                            "reason": "Cannot invite yourself"
+                        })
+                        continue
+                    else:
+                        existing_type = existing_user.get("user_type", "user")
+                        results["failed"].append({
+                            "email": member_data.email,
+                            "reason": f"Already registered as {existing_type}"
+                        })
+                        continue
+                
+                # Generate unique invite token
+                invite_token = str(uuid.uuid4())
+                
+                # Create member record
+                member_doc = {
+                    "org_email": org_email,
+                    "member_email": member_data.email,
+                    "member_name": member_data.name,
+                    "role": "member",
+                    "status": "pending",
+                    "invite_token": invite_token,
+                    "invited_by": org_email,
+                    "invited_at": datetime.utcnow(),
+                    "accepted_at": None,
+                    "password_hash": None,
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+                
+                await organization_members_collection.insert_one(member_doc)
+                
+                # Send invitation email in background
+                invite_link = f"{frontend_url}/invite-accept/{invite_token}"
+                from services.email_service import send_member_invitation_email
+                background_tasks.add_task(
+                    send_member_invitation_email,
+                    member_data.email,
+                    member_data.name,
+                    org_name,
+                    invite_link
+                )
+                
+                results["success"].append({
+                    "email": member_data.email,
+                    "name": member_data.name
+                })
+                
+            except Exception as e:
+                print(f"❌ Error inviting {member_data.email}: {e}")
+                results["failed"].append({
+                    "email": member_data.email,
+                    "reason": str(e)
+                })
+        
+        print(f"✅ [POST /api/organization/invite-members-bulk] Invited {len(results['success'])} members, {len(results['failed'])} failed")
+        
+        return {
+            "success": True,
+            "message": f"Invited {len(results['success'])} member(s), {len(results['failed'])} failed",
+            "results": results
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in bulk invite: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error inviting members: {str(e)}"
+        )
+
+
+class RespondInviteRequest(BaseModel):
+    token: str
+    action: str  # "accept" or "reject"
+    password: Optional[str] = None
+
+@app.post("/api/organization/respond-invite")
+async def respond_invite(request: RespondInviteRequest):
+    """
+    Accept or reject organization invitation (Public endpoint)
+    """
+    try:
+        if request.action not in ["accept", "reject"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Action must be 'accept' or 'reject'"
+            )
+        
+        # Find member record by token
+        member_info = await organization_members_collection.find_one({
+            "invite_token": request.token,
+            "status": "pending"
+        })
+        
+        if not member_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Invalid or expired invitation token"
+            )
+        
+        if request.action == "reject":
+            # Update status to rejected
+            await organization_members_collection.update_one(
+                {"invite_token": request.token},
+                {
+                    "$set": {
+                        "status": "rejected",
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+            
+            return {
+                "success": True,
+                "message": "Invitation rejected"
+            }
+        
+        # Accept action
+        if not request.password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password is required to accept invitation"
+            )
+        
+        if len(request.password) < 8:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password must be at least 8 characters long"
+            )
+        
+        member_email = member_info["member_email"]
+        member_name = member_info["member_name"]
+        org_email = member_info["org_email"]
+        
+        # Check if user already exists with ANY user_type
+        existing_user = await users_collection.find_one({"email": member_email})
+        
+        if existing_user:
+            # Check if existing user is already a member of this org
+            existing_member = await organization_members_collection.find_one({
+                "member_email": member_email,
+                "org_email": org_email,
+                "status": "accepted"
+            })
+            
+            if existing_member:
+                # Already a member, just update status
+                await organization_members_collection.update_one(
+                    {"invite_token": request.token},
+                    {
+                        "$set": {
+                            "status": "accepted",
+                            "accepted_at": datetime.utcnow(),
+                            "updated_at": datetime.utcnow()
+                        }
+                    }
+                )
+            else:
+                # User exists but not as member - check if they're organization type
+                if existing_user.get("user_type") != "organization":
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="This email is already registered as a candidate. Cannot add as organization member."
+                    )
+                # User exists as organization type, just update member record
+                await organization_members_collection.update_one(
+                    {"invite_token": request.token},
+                    {
+                        "$set": {
+                            "status": "accepted",
+                            "accepted_at": datetime.utcnow(),
+                            "updated_at": datetime.utcnow()
+                        }
+                    }
+                )
+        else:
+            # Create new user account as organization member
+            password_hash = get_password_hash(request.password)
+            
+            user_doc = {
+                "email": member_email,
+                "name": member_name,
+                "password": password_hash,
+                "user_type": "organization",
+                "org_member_of": org_email,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            
+            await users_collection.insert_one(user_doc)
+            
+            # Update member record
+            await organization_members_collection.update_one(
+                {"invite_token": request.token},
+                {
+                    "$set": {
+                        "status": "accepted",
+                        "password_hash": password_hash,
+                        "accepted_at": datetime.utcnow(),
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+        
+        print(f"✅ [POST /api/organization/respond-invite] Member {member_email} accepted invitation")
+        
+        return {
+            "success": True,
+            "message": "Invitation accepted successfully. You can now login.",
+            "email": member_email
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error responding to invite: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error responding to invite: {str(e)}"
+        )
+
+
+@app.get("/api/organization/members")
+async def get_organization_members(current_user: dict = Depends(get_current_user)):
+    """
+    Get all members of the organization (Owner only)
+    """
+    try:
+        # Verify user is an organization
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+        
+        # Check if user is owner
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can view members"
+            )
+        
+        org_email = current_user["email"]
+        
+        # Get all members
+        members_cursor = organization_members_collection.find({
+            "org_email": org_email
+        }).sort("created_at", -1)
+        
+        members = []
+        async for member in members_cursor:
+            member["_id"] = str(member["_id"])
+            # Don't send password hash
+            if "password_hash" in member:
+                del member["password_hash"]
+            members.append(member)
+        
+        return {
+            "success": True,
+            "members": members
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching members: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching members: {str(e)}"
+        )
+
+
+class ResendInviteRequest(BaseModel):
+    member_email: EmailStr
+
+@app.post("/api/organization/resend-invite")
+async def resend_invitation(
+    request: ResendInviteRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Resend invitation email to a pending member (Owner only)
+    """
+    try:
+        # Verify user is an organization
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+        
+        # Check if user is owner
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can resend invitations"
+            )
+        
+        org_email = current_user["email"]
+        
+        # Find the member
+        member_info = await organization_members_collection.find_one({
+            "org_email": org_email,
+            "member_email": request.member_email
+        })
+        
+        if not member_info:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Member not found"
+            )
+        
+        if member_info.get("status") == "accepted":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Member has already accepted the invitation"
+            )
+        
+        # Generate new invite token
+        invite_token = str(uuid.uuid4())
+        
+        # Update member record with new token
+        await organization_members_collection.update_one(
+            {"org_email": org_email, "member_email": request.member_email},
+            {
+                "$set": {
+                    "invite_token": invite_token,
+                    "invited_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Get organization name
+        org_data = await organization_data_collection.find_one({"email": org_email})
+        org_name = org_data.get("name", org_email) if org_data else org_email
+        
+        # Send invitation email in background
+        from services.email_service import send_member_invitation_email
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        invite_link = f"{frontend_url}/invite-accept/{invite_token}"
+        
+        background_tasks.add_task(
+            send_member_invitation_email,
+            request.member_email,
+            member_info["member_name"],
+            org_name,
+            invite_link
+        )
+        
+        print(f"✅ [POST /api/organization/resend-invite] Resent invitation to {request.member_email}")
+        
+        return {
+            "success": True,
+            "message": "Invitation resent successfully"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error resending invitation: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error resending invitation: {str(e)}"
+        )
+
+
 # ==================== ORGANIZATION JOB POSTING ENDPOINTS ====================
 
 class JobPostData(BaseModel):
@@ -879,14 +1557,23 @@ async def create_job_post(
             )
 
         # Get organization data for company info
+        org_email = get_org_email(current_user)
         org_data = await organization_data_collection.find_one({
-            "email": current_user["email"]
+            "email": org_email
         })
 
         if not org_data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Organization profile not found. Please complete your profile first."
+            )
+
+        # Check if organization has employees (required for AI notes feature)
+        employees_details = org_data.get("employees_details", [])
+        if not employees_details or len(employees_details) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Please add at least one employee to your organization profile before posting a job. This is required for AI-powered candidate comparison and notes."
             )
 
         # Handle file upload
@@ -914,8 +1601,9 @@ async def create_job_post(
             "job_id": job_id,
             "company": {
                 "name": org_data.get("name", current_user.get("name", "")),
-                "email": current_user["email"]
+                "email": org_email
             },
+            "created_by": current_user["email"],  # Track who created the job
             "role": role,
             "file_path": file_path,
             "location": location,
@@ -966,10 +1654,16 @@ async def get_organization_jobs(current_user: dict = Depends(get_current_user)):
         # First, automatically move any expired jobs to ongoing
         await move_expired_jobs_to_ongoing()
 
+        # Build query based on user role
+        org_email = get_org_email(current_user)
+        query = {"company.email": org_email}
+        
+        # If member, filter to only their jobs
+        if is_org_member(current_user):
+            query["created_by"] = current_user["email"]
+
         # Get open jobs for this organization
-        jobs_cursor = open_jobs_collection.find({
-            "company.email": current_user["email"]
-        }).sort("created_at", -1)
+        jobs_cursor = open_jobs_collection.find(query).sort("created_at", -1)
 
         jobs = []
         async for job in jobs_cursor:
@@ -994,7 +1688,8 @@ async def get_organization_jobs(current_user: dict = Depends(get_current_user)):
 
         return {
             "success": True,
-            "jobs": jobs
+            "jobs": jobs,
+            "user_role": current_user.get("role", "owner")  # Include role in response
         }
 
     except HTTPException:
@@ -1023,16 +1718,25 @@ async def close_job_posting(
                 detail="Only organizations can access this endpoint"
             )
 
+        org_email = get_org_email(current_user)
+        
         # Find the job in ongoing-jobs collection
         job = await ongoing_jobs_collection.find_one({
             "job_id": job_id,
-            "company.email": current_user["email"]
+            "company.email": org_email
         })
 
         if not job:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found or not in ongoing status"
+            )
+        
+        # Check permission
+        if not can_edit_job(job, current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to close this job"
             )
 
         # Convert ObjectId to string for transfer
@@ -1088,6 +1792,31 @@ async def update_applicant_status(
                 detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
             )
 
+        org_email = get_org_email(current_user)
+        
+        # Find the job to check permissions
+        job = None
+        for collection in [open_jobs_collection, ongoing_jobs_collection, closed_jobs_collection]:
+            job = await collection.find_one({
+                "job_id": job_id,
+                "company.email": org_email
+            })
+            if job:
+                break
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Check permission
+        if not can_edit_job(job, current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to update applicants for this job"
+            )
+
         # Update status in job-applied collection
         result_applied = await job_applied_collection.update_one(
             {"job_id": job_id, "email": candidate_email},
@@ -1103,7 +1832,7 @@ async def update_applicant_status(
             result_job = await collection.update_one(
                 {
                     "job_id": job_id,
-                    "company.email": current_user["email"],
+                    "company.email": org_email,
                     "applied_candidates.email": candidate_email
                 },
                 {
@@ -1154,10 +1883,16 @@ async def get_ongoing_job_posts(current_user: dict = Depends(get_current_user)):
                 detail="Only organizations can access this endpoint"
             )
 
+        # Build query based on user role
+        org_email = get_org_email(current_user)
+        query = {"company.email": org_email}
+        
+        # If member, filter to only their jobs
+        if is_org_member(current_user):
+            query["created_by"] = current_user["email"]
+
         # Get ongoing jobs for this organization
-        jobs_cursor = ongoing_jobs_collection.find({
-            "company.email": current_user["email"]
-        }).sort("created_at", -1)
+        jobs_cursor = ongoing_jobs_collection.find(query).sort("created_at", -1)
 
         jobs = []
         async for job in jobs_cursor:
@@ -1322,10 +2057,16 @@ async def get_closed_job_posts(current_user: dict = Depends(get_current_user)):
                 detail="Only organizations can access this endpoint"
             )
 
+        # Build query based on user role
+        org_email = get_org_email(current_user)
+        query = {"company.email": org_email}
+        
+        # If member, filter to only their jobs
+        if is_org_member(current_user):
+            query["created_by"] = current_user["email"]
+
         # Get closed jobs for this organization
-        jobs_cursor = closed_jobs_collection.find({
-            "company.email": current_user["email"]
-        }).sort("closed_at", -1)
+        jobs_cursor = closed_jobs_collection.find(query).sort("closed_at", -1)
 
         jobs = []
         async for job in jobs_cursor:
@@ -1840,13 +2581,22 @@ async def create_or_update_team(
         if "_id" in team_data:
             team_data.pop("_id")
 
-        # Add/update organization email and timestamp
-        team_data["organization_email"] = current_user["email"]
+        org_email = get_org_email(current_user)
+        
+        # Add/update organization email, creator, and timestamp
+        team_data["organization_email"] = org_email
+        team_data["created_by"] = current_user["email"]  # Track creator
         team_data["updated_at"] = datetime.utcnow()
 
         # Create or update the teams document for this organization in separate collection
+        # Filter by creator for members, by org_email for owner
+        if is_org_member(current_user):
+            query = {"organization_email": org_email, "created_by": current_user["email"]}
+        else:
+            query = {"organization_email": org_email}
+        
         result = await organization_teams_collection.update_one(
-            {"organization_email": current_user["email"]},
+            query,
             {"$set": team_data},
             upsert=True
         )
@@ -1880,10 +2630,18 @@ async def get_organization_teams(current_user: dict = Depends(get_current_user))
                 detail="Only organizations can access this endpoint"
             )
 
+        org_email = get_org_email(current_user)
+        
+        # Build query
+        if is_org_member(current_user):
+            # Members see only their teams
+            query = {"organization_email": org_email, "created_by": current_user["email"]}
+        else:
+            # Owners see all teams
+            query = {"organization_email": org_email}
+        
         # Get organization teams data from separate collection
-        teams_data = await organization_teams_collection.find_one({
-            "organization_email": current_user["email"]
-        })
+        teams_data = await organization_teams_collection.find_one(query)
 
         if not teams_data:
             # Return empty teams structure if not found
