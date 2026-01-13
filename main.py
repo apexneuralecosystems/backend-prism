@@ -1632,7 +1632,7 @@ async def buy_credits(
             )
         
         # Calculate amount (1 credit = $10)
-        amount = request.num_credits * 10.0
+        amount = request.num_credits * 1.0
         org_email = get_org_email(current_user)
         
         # Get frontend URL from env
