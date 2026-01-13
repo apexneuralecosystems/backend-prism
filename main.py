@@ -1812,12 +1812,19 @@ async def get_organization_credits(
 async def get_payment_history(
     current_user: dict = Depends(get_current_user)
 ):
-    """Get payment transaction history for organization (visible to all org members)"""
+    """Get payment transaction history for organization (owner only)"""
     try:
         if current_user.get("user_type") != "organization":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Only organizations can access this endpoint"
+            )
+        
+        # Only organization owners can view payment history
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can view payment history"
             )
         
         org_email = get_org_email(current_user)
