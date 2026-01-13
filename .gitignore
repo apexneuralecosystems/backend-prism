@@ -1,28 +1,35 @@
-# Dependencies & builds
-node_modules/
-frontend/build/
-backend/static/uploads/
+# ==================== STATIC FILES & UPLOADS ====================
+# User-uploaded files (should not be in git)
+static/uploads/
+static/files/
+uploads/
 
-# Caches
+# ==================== CACHES ====================
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Env/secrets
+# ==================== ENVIRONMENT & SECRETS ====================
 .env
 .env.local
 .env.*.local
 
-# Archives/unneeded
-deleted_files/
-auth-backend/
+# ==================== CREDENTIALS ====================
+credentials.json
+token.json
 
-# OS/editor
+# ==================== OS & EDITOR ====================
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
-backend/credentials.json
-backend/token.json
-
-.env
-token.json
-credentials.json
+# ==================== ARCHIVES ====================
+deleted_files/
+auth-backend/
+*.log
+*.tmp

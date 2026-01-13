@@ -34,6 +34,7 @@ from services.auth_models import (
 from services.otp_service import generate_otp, store_otp, verify_otp
 from services.resume_parser import ResumeParser
 from services.comparator_agent import ComparatorAgent
+from services.payments import create_payment_order, capture_payment_order
 
 # Load environment variables
 backend_dir = Path(__file__).parent
@@ -69,6 +70,78 @@ interview_webhook_collection = db["interview_webhooks"]
 interview_feedback_collection = db["interview-feedback"]
 offer_webhook_collection = db["offer_webhooks"]
 review_requests_collection = db["review_requests"]
+payments_collection = db["payments"]
+
+# Initialize PayPal for apex framework (after environment variables are loaded)
+# Note: Since we use MongoDB (not PostgreSQL), apex Client won't work
+# We'll use a PostgreSQL connection string just for apex Client initialization
+# The actual database operations use MongoDB directly
+try:
+    from services.payments import set_payment_client
+    
+    # Initialize PayPal client from environment variables
+    paypal_client_id = os.getenv("PAYPAL_CLIENT_ID")
+    paypal_client_secret = os.getenv("PAYPAL_CLIENT_SECRET")
+    paypal_mode = os.getenv("PAYPAL_MODE", "sandbox")
+    
+    print(f"🔍 [PAYPAL INIT] Checking PayPal credentials...")
+    print(f"🔍 [PAYPAL INIT] PAYPAL_CLIENT_ID: {'SET' if paypal_client_id else 'NOT SET'}")
+    print(f"🔍 [PAYPAL INIT] PAYPAL_CLIENT_SECRET: {'SET' if paypal_client_secret else 'NOT SET'}")
+    print(f"🔍 [PAYPAL INIT] PAYPAL_MODE: {paypal_mode}")
+    
+    # Ensure PayPal environment variables are set in os.environ (apex reads directly from os.environ)
+    if paypal_client_id:
+        os.environ["PAYPAL_CLIENT_ID"] = paypal_client_id
+    if paypal_client_secret:
+        os.environ["PAYPAL_CLIENT_SECRET"] = paypal_client_secret
+    if paypal_mode:
+        os.environ["PAYPAL_MODE"] = paypal_mode
+    
+    if paypal_client_id and paypal_client_secret:
+        # Try to create apex Client with a dummy PostgreSQL URL (apex needs SQL database)
+        # We won't actually use this database - we just need the client for PayPal
+        try:
+            from apex.payments import set_client
+            from apex.client import Client
+            
+            # Use a dummy PostgreSQL URL (apex Client requires SQL database)
+            # This is just for initialization - we use MongoDB for actual data
+            # The Client won't actually connect since we don't use it for DB operations
+            dummy_postgres_url = "postgresql+asyncpg://dummy:dummy@localhost:5432/dummy"
+            print(f"🔍 [PAYPAL INIT] Creating apex Client with dummy PostgreSQL URL...")
+            apex_client = Client(
+                database_url=dummy_postgres_url,
+                secret_key=os.getenv("JWT_ACCESS_SECRET", "default-secret")
+            )
+            print(f"🔍 [PAYPAL INIT] Apex Client created successfully")
+            set_client(apex_client)
+            set_payment_client(apex_client)
+            print("✅ PayPal client initialized via apex framework")
+            print(f"   PayPal Mode: {paypal_mode}")
+            print(f"   Client ID: {paypal_client_id[:10]}...")
+        except Exception as client_error:
+            # If Client creation fails (e.g., no PostgreSQL), create a minimal mock
+            print(f"⚠️ [PAYPAL INIT] Could not create apex Client (expected with MongoDB): {client_error}")
+            print("   Creating minimal client for PayPal operations...")
+            
+            class MinimalPayPalClient:
+                """Minimal client object for PayPal when apex Client can't be used"""
+                pass
+            
+            minimal_client = MinimalPayPalClient()
+            set_payment_client(minimal_client)
+            print("✅ PayPal credentials configured (minimal client mode)")
+            print(f"   PayPal Mode: {paypal_mode}")
+            print(f"   Client ID: {paypal_client_id[:10]}...")
+            print("   Note: PayPal will use credentials from environment variables")
+    else:
+        print("❌ ERROR: PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET not set. Payment features will not work.")
+        print("   Please check your .env file at: backend/.env")
+        print("   Required variables: PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, PAYPAL_MODE")
+except Exception as e:
+    print(f"❌ ERROR: Failed to initialize PayPal: {e}")
+    import traceback
+    traceback.print_exc()
 
 # FastAPI app
 app = FastAPI(
@@ -111,6 +184,13 @@ class DemoRequest(BaseModel):
     date: str
     time: str
     comments: Optional[str] = ""
+
+class BuyCreditsRequest(BaseModel):
+    num_credits: int  # Number of credits to buy (1 credit = $10)
+
+class CaptureOrderRequest(BaseModel):
+    order_id: str
+    org_email: str
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -304,6 +384,7 @@ async def verify_otp_and_create_user(data: dict = Body(...)):
             "name": name,
             "user_type": user_type,
             "is_verified": True,
+            "credits": 1,  # Default credits for new users
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
@@ -1522,6 +1603,281 @@ async def resend_invitation(
         )
 
 
+# ==================== PAYMENT ENDPOINTS ====================
+
+@app.post("/api/payments/buy-credits")
+async def buy_credits(
+    request: BuyCreditsRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Create payment order for buying credits (Org owner only)"""
+    try:
+        # Only org owners can buy credits
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can buy credits"
+            )
+        
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can purchase credits"
+            )
+        
+        if request.num_credits < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Number of credits must be at least 1"
+            )
+        
+        # Calculate amount (1 credit = $10)
+        amount = request.num_credits * 10.0
+        org_email = get_org_email(current_user)
+        
+        # Get frontend URL from env
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        
+        # Create PayPal order
+        result = await create_payment_order(
+            amount=amount,
+            currency="USD",
+            description=f"Purchase {request.num_credits} credit(s) for job postings",
+            return_url=f"{frontend_url}/payment/success",
+            cancel_url=f"{frontend_url}/payment/cancel"
+        )
+        
+        # Save payment record
+        payment_doc = {
+            "order_id": result["order_id"],
+            "paypal_order_id": result["paypal_order_id"],
+            "org_email": org_email,
+            "amount": amount,
+            "currency": "USD",
+            "num_credits": request.num_credits,
+            "status": "created",
+            "description": f"Purchase {request.num_credits} credit(s)",
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        await payments_collection.insert_one(payment_doc)
+        
+        return {
+            "success": True,
+            "order_id": result["order_id"],
+            "approval_url": result["approval_url"],
+            "amount": amount,
+            "num_credits": request.num_credits
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error creating credit purchase order: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating payment order: {str(e)}"
+        )
+
+@app.post("/api/payments/capture-order")
+async def capture_order_endpoint(
+    request: CaptureOrderRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """Capture payment and add credits to organization"""
+    try:
+        # Find payment record
+        payment = await payments_collection.find_one({
+            "order_id": request.order_id,
+            "org_email": request.org_email
+        })
+        
+        if not payment:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Payment record not found"
+            )
+        
+        if payment.get("status") == "completed":
+            # Get current credits
+            org_owner = await users_collection.find_one({"email": request.org_email})
+            current_credits = org_owner.get("credits", 0) if org_owner else 0
+            return {
+                "success": True,
+                "message": "Payment already completed",
+                "credits_added": payment.get("num_credits", 0),
+                "total_credits": current_credits
+            }
+        
+        # Capture payment via PayPal
+        capture_result = await capture_payment_order(request.order_id)
+        
+        if capture_result.get("status") != "completed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Payment capture failed: {capture_result.get('status')}"
+            )
+        
+        # Update payment record
+        await payments_collection.update_one(
+            {"order_id": request.order_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "paypal_capture_id": capture_result.get("capture_id"),
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Add credits to organization owner's account
+        num_credits = payment.get("num_credits", 0)
+        org_owner = await users_collection.find_one({"email": request.org_email})
+        
+        if org_owner:
+            current_credits = org_owner.get("credits", 0)
+            new_credits = current_credits + num_credits
+            
+            await users_collection.update_one(
+                {"email": request.org_email},
+                {
+                    "$set": {
+                        "credits": new_credits,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Organization owner not found"
+            )
+        
+        return {
+            "success": True,
+            "message": "Payment captured and credits added successfully",
+            "credits_added": num_credits,
+            "total_credits": new_credits
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error capturing payment: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error capturing payment: {str(e)}"
+        )
+
+@app.get("/api/organization/credits")
+async def get_organization_credits(
+    current_user: dict = Depends(get_current_user)
+):
+    """Get organization's current credits (visible to all org members)"""
+    try:
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+        
+        org_email = get_org_email(current_user)
+        org_owner = await users_collection.find_one({"email": org_email})
+        
+        if not org_owner:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Organization not found"
+            )
+        
+        credits = org_owner.get("credits", 0)
+        
+        return {
+            "success": True,
+            "credits": credits,
+            "org_email": org_email
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching credits: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+@app.get("/api/organization/payment-history")
+async def get_payment_history(
+    current_user: dict = Depends(get_current_user)
+):
+    """Get payment transaction history for organization (visible to all org members)"""
+    try:
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+        
+        org_email = get_org_email(current_user)
+        
+        # Debug: Log what we're searching for
+        print(f"🔍 [PAYMENT HISTORY] Searching for payments with org_email: {org_email}")
+        
+        # Get all payments for this organization (including all statuses)
+        # Try matching both org_email and email fields to catch all payments
+        query = {
+            "$or": [
+                {"org_email": org_email},
+                {"email": org_email}  # Fallback for old payment records
+            ]
+        }
+        
+        payments_cursor = payments_collection.find(query).sort("created_at", -1)  # Most recent first
+        
+        transactions = []
+        async for payment in payments_cursor:
+            # Convert ObjectId to string
+            payment["_id"] = str(payment["_id"])
+            
+            # Format the transaction data
+            transaction = {
+                "id": str(payment["_id"]),
+                "order_id": payment.get("order_id"),
+                "amount": payment.get("amount", 0),
+                "currency": payment.get("currency", "USD"),
+                "num_credits": payment.get("num_credits", 0),
+                "description": payment.get("description", ""),
+                "status": payment.get("status", "unknown"),
+                "created_at": payment.get("created_at"),
+                "updated_at": payment.get("updated_at"),
+                "paypal_capture_id": payment.get("paypal_capture_id")
+            }
+            transactions.append(transaction)
+        
+        # Debug: Log what we found
+        print(f"🔍 [PAYMENT HISTORY] Found {len(transactions)} payments for org_email: {org_email}")
+        if transactions:
+            print(f"   Statuses: {[t['status'] for t in transactions]}")
+        
+        return {
+            "success": True,
+            "transactions": transactions,
+            "total_transactions": len(transactions)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching payment history: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
 # ==================== ORGANIZATION JOB POSTING ENDPOINTS ====================
 
 class JobPostData(BaseModel):
@@ -1556,8 +1912,25 @@ async def create_job_post(
                 detail="Only organizations can access this endpoint"
             )
 
-        # Get organization data for company info
+        # Get organization email (owner's email)
         org_email = get_org_email(current_user)
+        
+        # Check credits before posting
+        org_owner = await users_collection.find_one({"email": org_email})
+        if not org_owner:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Organization not found"
+            )
+        
+        current_credits = org_owner.get("credits", 0)
+        if current_credits < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Insufficient credits. Please purchase credits to post a job."
+            )
+
+        # Get organization data for company info
         org_data = await organization_data_collection.find_one({
             "email": org_email
         })
@@ -1619,13 +1992,26 @@ async def create_job_post(
 
         # Save to open-jobs collection
         result = await open_jobs_collection.insert_one(job_doc)
+        
+        # Deduct 1 credit after successful job creation
+        new_credits = current_credits - 1
+        await users_collection.update_one(
+            {"email": org_email},
+            {
+                "$set": {
+                    "credits": new_credits,
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
 
-        print(f"✅ [POST /api/organization-jobpost] Job created: {job_id}")
+        print(f"✅ [POST /api/organization-jobpost] Job created: {job_id}, Credits remaining: {new_credits}")
 
         return {
             "success": True,
             "message": "Job posting created successfully",
-            "job_id": job_id
+            "job_id": job_id,
+            "credits_remaining": new_credits
         }
 
     except HTTPException:
