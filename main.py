@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any
 import os
 import shutil
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import random
@@ -167,9 +168,30 @@ app.add_middleware(
 def get_frontend_base_url() -> str:
     """
     Base URL for shareable links (emails, AI interview, payments, invites, etc.).
-    Prefer FRONTEND_PUBLIC_URL in production; fallback to FRONTEND_URL, then localhost for dev.
+    Prefer FRONTEND_PUBLIC_URL; else FRONTEND_URL; else localhost.
+    If the result is localhost but BACKEND_URL is a production URL, derive frontend from BACKEND_URL
+    (e.g. https://prism.backend.apexneural.cloud -> https://prism.apexneural.cloud) so links work in production
+    even when FRONTEND_* vars are not passed into the container.
     """
-    return (os.getenv("FRONTEND_PUBLIC_URL") or os.getenv("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
+    u = (os.getenv("FRONTEND_PUBLIC_URL") or os.getenv("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
+    backend = (os.getenv("BACKEND_URL") or "").strip()
+    # If we resolved to localhost but BACKEND_URL looks like production, derive frontend from BACKEND_URL
+    if "localhost" in u and backend and "localhost" not in backend:
+        try:
+            p = urlparse(backend)
+            if p.scheme and p.hostname and ".backend." in p.hostname:
+                frontend_host = p.hostname.replace(".backend.", ".", 1)
+                u = f"{p.scheme}://{frontend_host}"
+        except Exception:
+            pass
+    return u.rstrip("/")
+
+
+# Log resolved frontend URL at startup (helps verify FRONTEND_PUBLIC_URL / FRONTEND_URL in Docker)
+_frontend_base = get_frontend_base_url()
+print(f"🔗 Frontend base URL for shareable links: {_frontend_base} (FRONTEND_PUBLIC_URL={bool(os.getenv('FRONTEND_PUBLIC_URL'))}, FRONTEND_URL={bool(os.getenv('FRONTEND_URL'))}, BACKEND_URL={bool(os.getenv('BACKEND_URL'))})")
+if "localhost" in _frontend_base:
+    print("⚠️ WARNING: Shareable links will use localhost. Set FRONTEND_PUBLIC_URL or FRONTEND_URL, or BACKEND_URL (e.g. https://prism.backend.apexneural.cloud) to derive it.")
 
 
 # Mount Static Files
