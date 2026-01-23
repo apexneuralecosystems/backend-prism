@@ -1999,7 +1999,7 @@ async def create_job_post(
 
         # Save to open-jobs collection
         result = await open_jobs_collection.insert_one(job_doc)
-        
+
         # Deduct 1 credit after successful job creation
         new_credits = current_credits - 1
         await users_collection.update_one(
@@ -3208,6 +3208,7 @@ class SendInterviewFormRequest(BaseModel):
     team: str
     job_id: str
     location_type: str  # "online" or "offline"
+    is_ai_interview: Optional[bool] = False  # NEW: Flag for AI interview
 
 @app.post("/api/send-interview-form")
 async def send_interview_form(
@@ -3272,8 +3273,16 @@ async def send_interview_form(
         # Create unique webhook ID for this interview request
         webhook_id = str(uuid.uuid4())
         
-        # Create form link with webhook ID
-        form_link = f"{frontend_url}/schedule-interview?webhook_id={webhook_id}&applicantEmail={request.applicantEmail}&applicantName={request.applicantName}&orgEmail={request.orgEmail}&orgName={request.orgName}&round={request.round}&team={request.team}"
+        # Check if this is an AI interview
+        is_ai_interview = getattr(request, 'is_ai_interview', False)
+        
+        # Create form link or AI interview link
+        if is_ai_interview:
+            # AI interview direct link
+            form_link = f"{frontend_url}/ai-interview?job_id={request.job_id}&email={request.applicantEmail}"
+        else:
+            # Regular interview scheduling form
+            form_link = f"{frontend_url}/schedule-interview?webhook_id={webhook_id}&applicantEmail={request.applicantEmail}&applicantName={request.applicantName}&orgEmail={request.orgEmail}&orgName={request.orgName}&round={request.round}&team={request.team}"
         
         # Store webhook mapping first to ensure correct matching
         await interview_webhook_collection.insert_one({
@@ -3283,9 +3292,11 @@ async def send_interview_form(
             "orgEmail": request.orgEmail,
             "orgName": request.orgName,
             "round": request.round,
-            "team": request.team,
+            "team": request.team if not is_ai_interview else "",
             "job_id": request.job_id,
-            "location_type": request.location_type,
+            "location_type": request.location_type if not is_ai_interview else "ai_online",
+            "is_ai_interview": is_ai_interview,
+            "interview_link": form_link if is_ai_interview else "",
             "created_at": datetime.utcnow()
         })
         
@@ -3317,13 +3328,26 @@ async def send_interview_form(
         
         # Send email using email service (after status update to ensure it happens)
         try:
-            success = await send_interview_form_email(
-                applicant_email=request.applicantEmail,
-                applicant_name=request.applicantName,
-                form_link=form_link,
-                round_name=request.round,
-                org_name=request.orgName
-            )
+            if is_ai_interview:
+                # Import AI interview email function
+                from services.email_service import send_ai_interview_invitation_email
+                success = await send_ai_interview_invitation_email(
+                    applicant_email=request.applicantEmail,
+                    applicant_name=request.applicantName,
+                    interview_link=form_link,
+                    round_name=request.round,
+                    org_name=request.orgName,
+                    job_id=request.job_id
+                )
+            else:
+                # Regular interview scheduling email
+                success = await send_interview_form_email(
+                    applicant_email=request.applicantEmail,
+                    applicant_name=request.applicantName,
+                    form_link=form_link,
+                    round_name=request.round,
+                    org_name=request.orgName
+                )
             
             if not success:
                 print(f"⚠️ Warning: Email sending failed for {request.applicantEmail}, but status has been updated")
@@ -4846,6 +4870,501 @@ async def submit_review_decision(
         print(f"❌ Error submitting review decision: {e}")
         import traceback
         traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+# ============================================================================
+# AI INTERVIEW ENDPOINTS
+# ============================================================================
+
+from services.ai_interview_service import AIInterviewAgent, MongoDBTranscriptStorage
+from fastapi import WebSocket, WebSocketDisconnect
+
+@app.post("/api/ai-interview/start")
+async def start_ai_interview(
+    job_id: str = Body(...),
+    email: str = Body(...)
+):
+    """
+    Initialize AI interview session.
+    Fetch JD and resume from MongoDB, return session_id and WebSocket URL.
+    """
+    try:
+        # Fetch job details from all job collections
+        job = None
+        for collection in [open_jobs_collection, ongoing_jobs_collection, closed_jobs_collection]:
+            job = await collection.find_one({"job_id": job_id})
+            if job:
+                break
+        
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        
+        # Extract JD text from file
+        jd_text = ""
+        jd_file_path = job.get("file_path", "")
+        if jd_file_path:
+            try:
+                jd_path = static_dir / jd_file_path.lstrip("/static/")
+                if jd_path.exists():
+                    with open(jd_path, "rb") as f:
+                        jd_content = f.read()
+                    # Try to extract text from PDF
+                    try:
+                        pdf_reader = PyPDF2.PdfReader(io.BytesIO(jd_content))
+                        for page in pdf_reader.pages:
+                            jd_text += page.extract_text() + "\n"
+                    except:
+                        jd_text = jd_content.decode('utf-8', errors='ignore')
+            except Exception as e:
+                print(f"⚠️ Warning: Could not read JD file: {e}")
+        
+        # If no JD file, construct from job fields
+        if not jd_text:
+            jd_text = f"""Job Role: {job.get('role', 'N/A')}
+Location: {job.get('location', 'N/A')}
+Job Type: {job.get('job_type', 'N/A')}
+Package: {job.get('job_package_lpa', 'N/A')} LPA
+Number of Openings: {job.get('number_of_openings', 'N/A')}
+Notes: {job.get('notes', 'N/A')}"""
+        
+        # Fetch applicant details
+        applicant = await job_applied_collection.find_one({
+            "job_id": job_id,
+            "email": email
+        })
+        
+        if not applicant:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Applicant not found for this job"
+            )
+        
+        # Extract resume text
+        resume_text = ""
+        resume_url = applicant.get("resume_url", "")
+        if resume_url:
+            try:
+                resume_path = static_dir / resume_url.lstrip("/static/")
+                if resume_path.exists():
+                    with open(resume_path, "rb") as f:
+                        resume_content = f.read()
+                    # Try to extract text from PDF
+                    try:
+                        pdf_reader = PyPDF2.PdfReader(io.BytesIO(resume_content))
+                        for page in pdf_reader.pages:
+                            resume_text += page.extract_text() + "\n"
+                    except:
+                        resume_text = resume_content.decode('utf-8', errors='ignore')
+            except Exception as e:
+                print(f"⚠️ Warning: Could not read resume file: {e}")
+        
+        # Create session
+        session_id = str(uuid.uuid4())
+        
+        # Check if interview already completed
+        existing_completed = await interview_feedback_collection.find_one({
+            "applicant_email": email,
+            "job_id": job_id,
+            "type": "ai_interview",
+            "status": "completed"
+        })
+        
+        if existing_completed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Interview already completed. This link can only be used once."
+            )
+        
+        # Get webhook record to find round name
+        webhook = await interview_webhook_collection.find_one({
+            "applicantEmail": email,
+            "job_id": job_id,
+            "is_ai_interview": True,
+            "status": {"$ne": "completed"}
+        })
+        
+        round_name = webhook.get("round", "Initial Screening Round") if webhook else "Initial Screening Round"
+        
+        # Get IST time (UTC + 5:30)
+        from datetime import timedelta
+        ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        
+        # Store initial interview feedback record
+        await interview_feedback_collection.insert_one({
+            "feedback_id": session_id,
+            "job_id": job_id,
+            "applicant_email": email,
+            "applicant_name": applicant.get("name", ""),
+            "round": round_name,
+            "type": "ai_interview",
+            "session_id": session_id,
+            "transcript": [],
+            "recording_path": "",
+            "started_at": ist_now,  # Store in IST
+            "status": "incomplete"
+        })
+        
+        # Get backend URL from environment
+        backend_url = os.getenv("BACKEND_URL", "http://localhost:5555")
+        ws_protocol = "wss" if backend_url.startswith("https") else "ws"
+        ws_host = backend_url.replace("http://", "").replace("https://", "")
+        
+        print(f"✅ AI interview session created: {session_id} for {email} (job: {job_id})")
+        
+        return {
+            "success": True,
+            "session_id": session_id,
+            "ws_url": f"{ws_protocol}://{ws_host}/ws/ai-interview/{session_id}",
+            "jd_content": jd_text[:2000],  # Limit for initial load
+            "resume_content": resume_text[:2000]  # Limit for initial load
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error starting AI interview: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.websocket("/ws/ai-interview/{session_id}")
+async def ai_interview_websocket(websocket: WebSocket, session_id: str):
+    """
+    WebSocket endpoint for AI interview real-time audio streaming.
+    """
+    await websocket.accept()
+    print(f"🔗 AI Interview WebSocket connected: {session_id}")
+    
+    try:
+        # Get interview feedback record
+        feedback = await interview_feedback_collection.find_one({"feedback_id": session_id})
+        
+        if not feedback:
+            await websocket.close(code=1008, reason="Session not found")
+            return
+        
+        # Get JD and resume content for the agent
+        job_id = feedback.get("job_id")
+        email = feedback.get("applicant_email")
+        
+        # Fetch job and applicant details (similar to start endpoint)
+        job = None
+        for collection in [open_jobs_collection, ongoing_jobs_collection, closed_jobs_collection]:
+            job = await collection.find_one({"job_id": job_id})
+            if job:
+                break
+        
+        applicant = await job_applied_collection.find_one({
+            "job_id": job_id,
+            "email": email
+        })
+        
+        # Extract JD text
+        jd_text = ""
+        if job:
+            jd_file_path = job.get("file_path", "")
+            if jd_file_path:
+                try:
+                    jd_path = static_dir / jd_file_path.lstrip("/static/")
+                    if jd_path.exists():
+                        with open(jd_path, "rb") as f:
+                            jd_content = f.read()
+                        try:
+                            pdf_reader = PyPDF2.PdfReader(io.BytesIO(jd_content))
+                            for page in pdf_reader.pages:
+                                jd_text += page.extract_text() + "\n"
+                        except:
+                            jd_text = jd_content.decode('utf-8', errors='ignore')
+                except:
+                    pass
+            
+            if not jd_text:
+                jd_text = f"""Job Role: {job.get('role', 'N/A')}
+Location: {job.get('location', 'N/A')}
+Job Type: {job.get('job_type', 'N/A')}
+Notes: {job.get('notes', 'N/A')}"""
+        
+        # Extract resume text
+        resume_text = ""
+        if applicant:
+            resume_url = applicant.get("resume_url", "")
+            if resume_url:
+                try:
+                    resume_path = static_dir / resume_url.lstrip("/static/")
+                    if resume_path.exists():
+                        with open(resume_path, "rb") as f:
+                            resume_content = f.read()
+                        try:
+                            pdf_reader = PyPDF2.PdfReader(io.BytesIO(resume_content))
+                            for page in pdf_reader.pages:
+                                resume_text += page.extract_text() + "\n"
+                        except:
+                            resume_text = resume_content.decode('utf-8', errors='ignore')
+                except:
+                    pass
+        
+        # Verify OpenAI API key is loaded
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            print("❌ OPENAI_API_KEY not found in environment")
+            await websocket.close(code=1011, reason="OpenAI API key not configured")
+            return
+        
+        print(f"✅ OpenAI API Key loaded: {openai_key[:20]}...")
+        
+        # Create MongoDB storage
+        storage = MongoDBTranscriptStorage(interview_feedback_collection)
+        
+        # Create AI interview agent
+        agent = AIInterviewAgent(
+            openai_api_key=openai_key,
+            storage=storage,
+            jd_content=jd_text,
+            resume_content=resume_text
+        )
+        
+        print(f"✅ AIInterviewAgent initialized for session: {session_id}")
+        print(f"   JD length: {len(jd_text)} chars")
+        print(f"   Resume length: {len(resume_text)} chars")
+        
+        # Start the interview
+        print(f"🎤 Starting AI interview connection...")
+        await agent.connect(websocket, session_id=session_id, timeout_seconds=1200)
+        print(f"✅ AI interview completed for session: {session_id}")
+        
+    except WebSocketDisconnect:
+        print(f"🔌 AI Interview WebSocket disconnected: {session_id}")
+    except Exception as e:
+        print(f"❌ Error in AI interview WebSocket: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await websocket.close(code=1011, reason=str(e))
+        except:
+            pass
+
+
+@app.post("/api/ai-interview/save-recording")
+async def save_ai_interview_recording(
+    session_id: str = Form(...),
+    file: UploadFile = File(...)
+):
+    """
+    Save AI interview recording (WebM file).
+    """
+    try:
+        # Get interview feedback record
+        feedback = await interview_feedback_collection.find_one({"feedback_id": session_id})
+        
+        if not feedback:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Interview session not found"
+            )
+        
+        job_id = feedback.get("job_id")
+        email = feedback.get("applicant_email")
+        
+        # Create directory structure: backend/static/interviews/{job_id}/{email}/
+        interview_dir = static_dir / "interviews" / job_id / email.replace("@", "_at_")
+        interview_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate filename
+        filename = f"interview_{session_id}.webm"
+        file_path = interview_dir / filename
+        
+        # Save file
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        
+        # Update feedback record with recording path
+        relative_path = f"/static/interviews/{job_id}/{email.replace('@', '_at_')}/{filename}"
+        
+        # Get IST time (UTC + 5:30)
+        from datetime import timedelta
+        ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        
+        await interview_feedback_collection.update_one(
+            {"feedback_id": session_id},
+            {
+                "$set": {
+                    "recording_path": relative_path,
+                    "updated_at": ist_now  # Store in IST
+                }
+            }
+        )
+        
+        print(f"✅ AI interview recording saved: {relative_path}")
+        
+        return {
+            "success": True,
+            "recording_path": relative_path,
+            "filename": filename
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error saving AI interview recording: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.post("/api/ai-interview/complete")
+async def complete_ai_interview(
+    session_id: str = Body(...),
+    job_id: str = Body(...),
+    email: str = Body(...)
+):
+    """
+    Mark AI interview as complete.
+    Move round to previous_rounds and update candidate status.
+    """
+    try:
+        # Get IST time (UTC + 5:30)
+        from datetime import timedelta
+        ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        
+        # Update interview feedback status
+        await interview_feedback_collection.update_one(
+            {"feedback_id": session_id},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": ist_now  # Store in IST
+                }
+            }
+        )
+        
+        # Get feedback record to find round info
+        feedback = await interview_feedback_collection.find_one({"feedback_id": session_id})
+        
+        if not feedback:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Interview feedback not found"
+            )
+        
+        round_name = feedback.get("round", "Initial Screening Round")
+        recording_path = feedback.get("recording_path", "")
+        applicant_name = feedback.get("applicant_name", "Unknown")
+        
+        # Get started and completed timestamps
+        started_at = feedback.get("started_at", datetime.utcnow())
+        completed_at = feedback.get("completed_at", datetime.utcnow())
+        
+        # Convert UTC to IST (UTC + 5:30)
+        from datetime import timedelta
+        if isinstance(started_at, datetime):
+            ist_time = started_at + timedelta(hours=5, minutes=30)
+        else:
+            ist_time = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        
+        # Format date and time (12-hour format with AM/PM in IST - Hyderabad time)
+        interview_date = ist_time.strftime("%Y-%m-%d")
+        interview_time = ist_time.strftime("%I:%M %p")  # 12-hour format like "4:50 PM"
+        
+        # Create round entry for previous_rounds (without attended/outcome for AI interviews)
+        round_entry = {
+            "round": round_name,
+            "type": "ai_interview",
+            "feedback_id": session_id,
+            "interview_date": interview_date,
+            "interview_time": interview_time,
+            "completed_at": completed_at,
+            "status": "completed",
+            "recording_path": recording_path  # Include video path
+        }
+        
+        # Update job_applied: move to previous_rounds and update status
+        await job_applied_collection.update_one(
+            {"job_id": job_id, "email": email},
+            {
+                "$push": {"previous_rounds": round_entry},
+                "$set": {
+                    "status": "selected_for_interview",  # Ready for next round
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        # Update webhook status if exists
+        await interview_webhook_collection.update_many(
+            {
+                "applicantEmail": email,
+                "job_id": job_id,
+                "is_ai_interview": True,
+                "status": {"$ne": "completed"}
+            },
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": datetime.utcnow()
+                }
+            }
+        )
+        
+        print(f"✅ AI interview completed: {session_id} for {email} (job: {job_id})")
+        
+        return {
+            "success": True,
+            "message": "AI interview completed successfully"
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error completing AI interview: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/api/interview-feedback/{feedback_id}")
+async def get_interview_feedback(
+    feedback_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get interview feedback by feedback_id (for viewing AI interview transcripts).
+    """
+    try:
+        feedback = await interview_feedback_collection.find_one({"feedback_id": feedback_id})
+        
+        if not feedback:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Interview feedback not found"
+            )
+        
+        # Convert ObjectId to string for JSON serialization
+        if '_id' in feedback:
+            feedback['_id'] = str(feedback['_id'])
+        
+        return feedback
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching interview feedback: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)

@@ -2453,3 +2453,298 @@ async def send_member_invitation_email(member_email: str, member_name: str, org_
         from_email=from_email,
         html_content=html_content
     )
+
+
+async def send_ai_interview_invitation_email(
+    applicant_email: str,
+    applicant_name: str,
+    interview_link: str,
+    round_name: str,
+    org_name: str,
+    job_id: str
+) -> bool:
+    """
+    Send AI interview invitation email to applicant.
+    Emphasizes AI-conducted interview with technical requirements.
+    """
+    try:
+        from_email = os.getenv("FROM_EMAIL")
+        password = os.getenv("EMAIL_PASSWORD")
+        
+        if not from_email or not password:
+            print("❌ Email credentials not configured")
+            return False
+        
+        subject = f"AI Interview Invitation - {round_name} at {org_name}"
+        
+        # HTML email content with modern styling
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body {{ 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+                    line-height: 1.6; 
+                    color: #111827;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    margin: 0;
+                    padding: 40px 20px;
+                }}
+                .container {{ 
+                    max-width: 640px; 
+                    margin: 0 auto; 
+                    background: #ffffff;
+                    border-radius: 20px;
+                    overflow: hidden;
+                    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+                }}
+                .header {{ 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white; 
+                    padding: 40px 32px; 
+                    text-align: center;
+                }}
+                .header-icon {{
+                    width: 70px;
+                    height: 70px;
+                    background: rgba(255, 255, 255, 0.2);
+                    border-radius: 18px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin: 0 auto 20px;
+                    font-size: 36px;
+                    backdrop-filter: blur(10px);
+                }}
+                .header h2 {{
+                    margin: 0;
+                    font-size: 28px;
+                    font-weight: 800;
+                    letter-spacing: -0.5px;
+                }}
+                .content {{ 
+                    background: #ffffff; 
+                    padding: 36px 32px;
+                }}
+                .content p {{
+                    margin: 0 0 16px 0;
+                    font-size: 15px;
+                    line-height: 1.7;
+                    color: #4b5563;
+                }}
+                .content p.greeting {{
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #111827;
+                    margin-bottom: 20px;
+                }}
+                .ai-badge {{
+                    display: inline-block;
+                    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+                    color: white;
+                    padding: 8px 16px;
+                    border-radius: 20px;
+                    font-size: 13px;
+                    font-weight: 700;
+                    margin: 16px 0;
+                    letter-spacing: 0.5px;
+                }}
+                .details-box {{
+                    background: linear-gradient(to bottom right, #f0f7ff, #e0f2fe);
+                    padding: 24px;
+                    border-radius: 16px;
+                    margin: 28px 0;
+                    border: 2px solid #667eea;
+                    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.1);
+                }}
+                .details-box p {{
+                    margin: 12px 0;
+                    font-size: 15px;
+                    color: #1f2937;
+                }}
+                .details-box strong {{
+                    font-weight: 700;
+                    color: #111827;
+                    min-width: 80px;
+                    display: inline-block;
+                }}
+                .requirements-box {{
+                    background: linear-gradient(to right, #fef3c7, #fde68a);
+                    border-left: 4px solid #f59e0b;
+                    padding: 20px;
+                    border-radius: 12px;
+                    margin: 24px 0;
+                }}
+                .requirements-box h3 {{
+                    margin: 0 0 12px 0;
+                    color: #92400e;
+                    font-size: 16px;
+                    font-weight: 700;
+                }}
+                .requirements-box ul {{
+                    margin: 0;
+                    padding-left: 20px;
+                    color: #78350f;
+                }}
+                .requirements-box li {{
+                    margin: 8px 0;
+                    font-size: 14px;
+                }}
+                .button {{ 
+                    display: inline-block; 
+                    padding: 16px 36px; 
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white; 
+                    text-decoration: none; 
+                    border-radius: 12px; 
+                    margin: 24px 0;
+                    font-weight: 700;
+                    font-size: 16px;
+                    box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+                    transition: all 0.3s;
+                }}
+                .button:hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 8px 25px rgba(102, 126, 234, 0.5);
+                }}
+                .info-box {{
+                    background: linear-gradient(to right, #dbeafe, #bfdbfe);
+                    border-left: 4px solid #3b82f6;
+                    padding: 16px 20px;
+                    border-radius: 12px;
+                    margin: 24px 0;
+                }}
+                .info-box p {{
+                    margin: 0;
+                    color: #1e40af;
+                    font-weight: 600;
+                    font-size: 14px;
+                }}
+                .footer {{
+                    background: linear-gradient(to bottom, #f9fafb, #f3f4f6);
+                    padding: 24px 32px;
+                    text-align: center;
+                    border-top: 2px solid #e5e7eb;
+                }}
+                .footer p {{
+                    margin: 6px 0;
+                    color: #6b7280;
+                    font-size: 13px;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <div class="header-icon">🤖</div>
+                    <h2>AI Interview Invitation</h2>
+                    <p style="margin: 8px 0 0 0; opacity: 0.95; font-size: 15px;">You're invited for an AI-powered interview</p>
+                </div>
+                <div class="content">
+                    <p class="greeting">👋 Dear {applicant_name},</p>
+                    <p>Congratulations! You have been selected for an AI-powered interview for <strong>{round_name}</strong> at <strong>{org_name}</strong>.</p>
+                    
+                    <div style="text-align: center;">
+                        <span class="ai-badge">🤖 AI-POWERED INTERVIEW</span>
+                    </div>
+                    
+                    <div class="details-box">
+                        <p><strong>Round:</strong> {round_name}</p>
+                        <p><strong>Company:</strong> {org_name}</p>
+                        <p><strong>Duration:</strong> 15-20 minutes</p>
+                        <p><strong>Format:</strong> Real-time voice conversation with AI</p>
+                    </div>
+                    
+                    <div class="requirements-box">
+                        <h3>⚙️ Technical Requirements</h3>
+                        <ul>
+                            <li>Chrome or Edge browser (latest version recommended)</li>
+                            <li>Working microphone and speakers/headphones</li>
+                            <li>Stable internet connection</li>
+                            <li>Quiet environment for the interview</li>
+                            <li>Screen sharing permission (for recording purposes)</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="info-box">
+                        <p>💡 The AI interviewer will ask you questions based on your resume and the job requirements. The interview will be recorded for evaluation purposes.</p>
+                    </div>
+                    
+                    <div style="text-align: center;">
+                        <a href="{interview_link}" class="button">Start AI Interview</a>
+                    </div>
+                    
+                    <p style="margin-top: 20px; font-size: 12px; color: #666;">
+                        If the button doesn't work, copy and paste this link into your browser:<br>
+                        {interview_link}
+                    </p>
+                    
+                    <p style="margin-top: 32px; padding-top: 24px; border-top: 2px solid #e5e7eb;">
+                        <strong>Best regards,</strong><br>
+                        <strong style="color: #667eea; font-size: 16px;">{org_name} Team</strong>
+                    </p>
+                </div>
+                <div class="footer">
+                    <p><strong>© 2024 PRISM</strong> - APEXNEURAL</p>
+                    <p>This is an automated AI interview invitation. Please ensure you meet the technical requirements before starting.</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        
+        # Plain text version
+        message = f"""
+        Dear {applicant_name},
+        
+        Congratulations! You have been selected for an AI-powered interview for {round_name} at {org_name}.
+        
+        🤖 AI-POWERED INTERVIEW
+        
+        Interview Details:
+        - Round: {round_name}
+        - Company: {org_name}
+        - Duration: 15-20 minutes
+        - Format: Real-time voice conversation with AI
+        
+        Technical Requirements:
+        - Chrome or Edge browser (latest version)
+        - Working microphone and speakers/headphones
+        - Stable internet connection
+        - Quiet environment
+        - Screen sharing permission
+        
+        Click this link to start your interview: {interview_link}
+        
+        The AI interviewer will ask you questions based on your resume and the job requirements. The interview will be recorded for evaluation purposes.
+        
+        Best regards,
+        {org_name} Team
+        
+        © 2024 PRISM - APEXNEURAL
+        """
+        
+        success = send_mail(
+            to_emails=applicant_email,
+            subject=subject,
+            message=message,
+            password=password,
+            from_email=from_email,
+            html_content=html_content
+        )
+        
+        if success:
+            print(f"✅ AI interview invitation email sent to {applicant_email}")
+        else:
+            print(f"❌ Failed to send AI interview invitation email to {applicant_email}")
+        
+        return success
+        
+    except Exception as e:
+        print(f"❌ Error in send_ai_interview_invitation_email: {e}")
+        import traceback
+        traceback.print_exc()
+        return False

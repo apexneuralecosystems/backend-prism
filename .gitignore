@@ -2,6 +2,7 @@
 # User-uploaded files (should not be in git)
 static/uploads/
 static/files/
+static/interviews/
 uploads/
 
 # ==================== CACHES ====================
