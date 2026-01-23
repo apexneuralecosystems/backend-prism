@@ -163,7 +163,7 @@ def extract_text_from_file(file_content: bytes, filename: str) -> str:
                 pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
                 text = ""
                 for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
+                    text += (page.extract_text() or "") + "\n"
                 return text.strip()
             except ImportError:
                 return "Error: PyPDF2 not installed. Please install it to read PDF files."
