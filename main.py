@@ -198,6 +198,47 @@ if "localhost" in _frontend_base:
 static_dir = backend_dir / "static"
 static_dir.mkdir(exist_ok=True)
 (static_dir / "uploads").mkdir(exist_ok=True)
+
+
+def _read_text_from_static_file(static_dir: Path, relative_or_static_path: str) -> str:
+    """
+    Read a file from static dir and extract text. Supports PDF, DOCX, TXT.
+    Path can be e.g. /static/files/jds/x.pdf, static/files/jds/x.pdf, or files/jds/x.pdf.
+    Returns '' on failure.
+    """
+    if not relative_or_static_path or not isinstance(relative_or_static_path, str):
+        return ""
+    p = relative_or_static_path.strip()
+    if p.startswith("/static/"):
+        p = p[8:].lstrip("/")
+    elif p.startswith("static/"):
+        p = p[7:].lstrip("/")
+    else:
+        p = p.lstrip("/")
+    # Ignore full URLs (e.g. https://...)
+    if p.startswith("http://") or p.startswith("https://"):
+        return ""
+    if not p:
+        return ""
+    full = static_dir / p
+    if not full.exists():
+        return ""
+    try:
+        content = full.read_bytes()
+        from services.rag import extract_text_from_file
+        out = extract_text_from_file(content, full.name)
+        if out and not out.startswith("Error:"):
+            return out.strip()
+        # Fallback for PDF
+        if full.suffix.lower() == ".pdf":
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+            return "\n".join((page.extract_text() or "") for page in pdf_reader.pages).strip()
+        return content.decode("utf-8", errors="ignore").strip() or ""
+    except Exception as e:
+        print(f"⚠️ Could not extract text from {full}: {e}")
+        return ""
+
+
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # Security
@@ -4933,26 +4974,8 @@ async def start_ai_interview(
                 detail="Job not found"
             )
         
-        # Extract JD text from file
-        jd_text = ""
-        jd_file_path = job.get("file_path", "")
-        if jd_file_path:
-            try:
-                jd_path = static_dir / jd_file_path.lstrip("/static/")
-                if jd_path.exists():
-                    with open(jd_path, "rb") as f:
-                        jd_content = f.read()
-                    # Try to extract text from PDF
-                    try:
-                        pdf_reader = PyPDF2.PdfReader(io.BytesIO(jd_content))
-                        for page in pdf_reader.pages:
-                            jd_text += page.extract_text() + "\n"
-                    except:
-                        jd_text = jd_content.decode('utf-8', errors='ignore')
-            except Exception as e:
-                print(f"⚠️ Warning: Could not read JD file: {e}")
-        
-        # If no JD file, construct from job fields
+        # Extract JD text from file (supports PDF, DOCX, TXT)
+        jd_text = _read_text_from_static_file(static_dir, job.get("file_path", ""))
         if not jd_text:
             jd_text = f"""Job Role: {job.get('role', 'N/A')}
 Location: {job.get('location', 'N/A')}
@@ -4973,24 +4996,15 @@ Notes: {job.get('notes', 'N/A')}"""
                 detail="Applicant not found for this job"
             )
         
-        # Extract resume text
-        resume_text = ""
-        resume_url = applicant.get("resume_url", "")
-        if resume_url:
-            try:
-                resume_path = static_dir / resume_url.lstrip("/static/")
-                if resume_path.exists():
-                    with open(resume_path, "rb") as f:
-                        resume_content = f.read()
-                    # Try to extract text from PDF
-                    try:
-                        pdf_reader = PyPDF2.PdfReader(io.BytesIO(resume_content))
-                        for page in pdf_reader.pages:
-                            resume_text += page.extract_text() + "\n"
-                    except:
-                        resume_text = resume_content.decode('utf-8', errors='ignore')
-            except Exception as e:
-                print(f"⚠️ Warning: Could not read resume file: {e}")
+        # Extract resume text (supports PDF, DOCX, TXT); fallback to user_data if job_applied has no resume_url
+        resume_text = _read_text_from_static_file(static_dir, applicant.get("resume_url", ""))
+        if not resume_text and applicant.get("email"):
+            user_profile = await user_data_collection.find_one({"user_email": applicant["email"]})
+            if user_profile:
+                resume_text = _read_text_from_static_file(
+                    static_dir,
+                    user_profile.get("resumeUrl") or user_profile.get("resume_url") or ""
+                )
         
         # Create session
         session_id = str(uuid.uuid4())
@@ -5097,49 +5111,25 @@ async def ai_interview_websocket(websocket: WebSocket, session_id: str):
             "email": email
         })
         
-        # Extract JD text
-        jd_text = ""
-        if job:
-            jd_file_path = job.get("file_path", "")
-            if jd_file_path:
-                try:
-                    jd_path = static_dir / jd_file_path.lstrip("/static/")
-                    if jd_path.exists():
-                        with open(jd_path, "rb") as f:
-                            jd_content = f.read()
-                        try:
-                            pdf_reader = PyPDF2.PdfReader(io.BytesIO(jd_content))
-                            for page in pdf_reader.pages:
-                                jd_text += page.extract_text() + "\n"
-                        except:
-                            jd_text = jd_content.decode('utf-8', errors='ignore')
-                except:
-                    pass
-            
-            if not jd_text:
-                jd_text = f"""Job Role: {job.get('role', 'N/A')}
+        # Extract JD text (supports PDF, DOCX, TXT)
+        jd_text = _read_text_from_static_file(static_dir, job.get("file_path", "")) if job else ""
+        if not jd_text and job:
+            jd_text = f"""Job Role: {job.get('role', 'N/A')}
 Location: {job.get('location', 'N/A')}
 Job Type: {job.get('job_type', 'N/A')}
 Notes: {job.get('notes', 'N/A')}"""
         
-        # Extract resume text
+        # Extract resume text (supports PDF, DOCX, TXT); fallback to user_data if job_applied has no resume_url
         resume_text = ""
         if applicant:
-            resume_url = applicant.get("resume_url", "")
-            if resume_url:
-                try:
-                    resume_path = static_dir / resume_url.lstrip("/static/")
-                    if resume_path.exists():
-                        with open(resume_path, "rb") as f:
-                            resume_content = f.read()
-                        try:
-                            pdf_reader = PyPDF2.PdfReader(io.BytesIO(resume_content))
-                            for page in pdf_reader.pages:
-                                resume_text += page.extract_text() + "\n"
-                        except:
-                            resume_text = resume_content.decode('utf-8', errors='ignore')
-                except:
-                    pass
+            resume_text = _read_text_from_static_file(static_dir, applicant.get("resume_url", ""))
+            if not resume_text and applicant.get("email"):
+                user_profile = await user_data_collection.find_one({"user_email": applicant["email"]})
+                if user_profile:
+                    resume_text = _read_text_from_static_file(
+                        static_dir,
+                        user_profile.get("resumeUrl") or user_profile.get("resume_url") or ""
+                    )
         
         # Verify OpenAI API key is loaded
         openai_key = os.getenv("OPENAI_API_KEY")
@@ -5164,6 +5154,10 @@ Notes: {job.get('notes', 'N/A')}"""
         print(f"✅ AIInterviewAgent initialized for session: {session_id}")
         print(f"   JD length: {len(jd_text)} chars")
         print(f"   Resume length: {len(resume_text)} chars")
+        if not jd_text:
+            print("⚠️ JD text empty: model will use job fields only. Check job.file_path and static file.")
+        if not resume_text:
+            print("⚠️ Resume text empty: model will have no resume. Check applicant.resume_url / user_data.resumeUrl and static file.")
         
         # Start the interview
         print(f"🎤 Starting AI interview connection...")
