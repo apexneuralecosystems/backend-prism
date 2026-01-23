@@ -16,6 +16,7 @@ import time
 import uuid
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
+import inspect
 
 # Import RAG module from same directory
 try:
@@ -52,6 +53,26 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def _websockets_connect_with_headers(url: str, headers: Dict[str, str], **kwargs):
+    """
+    Compatibility wrapper for `websockets.connect` across versions.
+
+    `websockets` has changed the kwarg name for passing HTTP headers:
+    - older versions: `extra_headers=...`
+    - newer versions: `additional_headers=...`
+    """
+    connect_sig = inspect.signature(websockets.connect)
+    params = connect_sig.parameters
+
+    if "additional_headers" in params:
+        return websockets.connect(url, additional_headers=headers, **kwargs)
+    if "extra_headers" in params:
+        return websockets.connect(url, extra_headers=headers, **kwargs)
+
+    # Last-resort: try without headers (will fail auth, but avoids crashing)
+    logger.warning("websockets.connect doesn't accept extra/additional headers; attempting without headers")
+    return websockets.connect(url, **kwargs)
 
 
 class MongoDBTranscriptStorage:
@@ -217,14 +238,17 @@ class AIInterviewAgent:
             print(f"   Model: {self.model}")
             print(f"   API Key: {self.openai_api_key[:20]}...")
             
-            async with websockets.connect(
-                f'wss://api.openai.com/v1/realtime?model={self.model}',
-                extra_headers={
-                    "Authorization": f"Bearer {self.openai_api_key}",
-                    "OpenAI-Beta": "realtime=v1"
-                },
+            openai_url = f"wss://api.openai.com/v1/realtime?model={self.model}"
+            openai_headers = {
+                "Authorization": f"Bearer {self.openai_api_key}",
+                "OpenAI-Beta": "realtime=v1",
+            }
+
+            async with _websockets_connect_with_headers(
+                openai_url,
+                headers=openai_headers,
                 ping_interval=20,
-                ping_timeout=10
+                ping_timeout=10,
             ) as openai_ws:
                 self.openai_ws = openai_ws
                 logger.info(f"✅ Connected to OpenAI Realtime API")
