@@ -163,6 +163,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def get_frontend_base_url() -> str:
+    """
+    Base URL for shareable links (emails, AI interview, payments, invites, etc.).
+    Prefer FRONTEND_PUBLIC_URL in production; fallback to FRONTEND_URL, then localhost for dev.
+    """
+    return (os.getenv("FRONTEND_PUBLIC_URL") or os.getenv("FRONTEND_URL") or "http://localhost:5173").rstrip("/")
+
+
 # Mount Static Files
 static_dir = backend_dir / "static"
 static_dir.mkdir(exist_ok=True)
@@ -1138,7 +1147,7 @@ async def invite_member(
         
         # Send invitation email in background (non-blocking)
         from services.email_service import send_member_invitation_email
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = get_frontend_base_url()
         invite_link = f"{frontend_url}/invite-accept/{invite_token}"
         
         background_tasks.add_task(
@@ -1195,7 +1204,7 @@ async def invite_members_bulk(
         # Get organization name
         org_data = await organization_data_collection.find_one({"email": org_email})
         org_name = org_data.get("name", org_email) if org_data else org_email
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = get_frontend_base_url()
         
         results = {
             "success": [],
@@ -1575,7 +1584,7 @@ async def resend_invitation(
         
         # Send invitation email in background
         from services.email_service import send_member_invitation_email
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = get_frontend_base_url()
         invite_link = f"{frontend_url}/invite-accept/{invite_token}"
         
         background_tasks.add_task(
@@ -1636,7 +1645,7 @@ async def buy_credits(
         org_email = get_org_email(current_user)
         
         # Get frontend URL from env
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+        frontend_url = get_frontend_base_url()
         
         # Create PayPal order
         result = await create_payment_order(
@@ -3226,9 +3235,8 @@ async def send_interview_form(
                 detail="Only organizations can access this endpoint"
             )
         
-        # Get frontend URL from environment
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        frontend_url = frontend_url.rstrip('/')
+        # Get frontend URL from environment (shareable links: AI interview, schedule-interview)
+        frontend_url = get_frontend_base_url()
         # Check candidate's current status
         applicant_doc = await job_applied_collection.find_one({
             "job_id": request.job_id,
@@ -3667,8 +3675,7 @@ async def submit_interview_form(request: SubmitInterviewFormRequest):
         
         # Create feedback form webhook ID first (needed for email)
         feedback_webhook_id = str(uuid.uuid4())
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        frontend_url = frontend_url.rstrip('/')
+        frontend_url = get_frontend_base_url()
         feedback_form_link = f"{frontend_url}/interview-feedback?feedback_id={feedback_webhook_id}&webhook_id={request.webhook_id}"
         
         # Store feedback webhook mapping
@@ -4183,8 +4190,7 @@ async def send_offer_letter(
         
         # Create webhook ID for offer response
         webhook_id = str(uuid.uuid4())
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        frontend_url = frontend_url.rstrip('/') 
+        frontend_url = get_frontend_base_url()
         form_link = f"{frontend_url}/offer-response?offer_id={webhook_id}"
         
         # Store offer webhook
@@ -4441,8 +4447,7 @@ async def create_review_request(
 
         await review_requests_collection.insert_one(review_doc)
 
-        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-        frontend_url = frontend_url.rstrip('/')
+        frontend_url = get_frontend_base_url()
         review_link = f"{frontend_url}/review-form?review_id={review_id}"
 
         # Get backend base URL for resume link
