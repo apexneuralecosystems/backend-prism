@@ -3400,15 +3400,34 @@ async def send_interview_form(
         # Send email using email service (after status update to ensure it happens)
         try:
             if is_ai_interview:
-                # Import AI interview email function
                 from services.email_service import send_ai_interview_invitation_email
+                jd_file_path = None
+                job = None
+                for coll in [open_jobs_collection, ongoing_jobs_collection, closed_jobs_collection]:
+                    job = await coll.find_one({"job_id": request.job_id})
+                    if job:
+                        break
+                if job:
+                    fp = (job.get("file_path") or "").strip()
+                    if fp and not fp.startswith("http://") and not fp.startswith("https://"):
+                        if fp.startswith("/static/"):
+                            fp = fp[8:].lstrip("/")
+                        elif fp.startswith("static/"):
+                            fp = fp[7:].lstrip("/")
+                        else:
+                            fp = fp.lstrip("/")
+                        if fp:
+                            full = static_dir / fp
+                            if full.exists():
+                                jd_file_path = str(full)
                 success = await send_ai_interview_invitation_email(
                     applicant_email=request.applicantEmail,
                     applicant_name=request.applicantName,
                     interview_link=form_link,
                     round_name=request.round,
                     org_name=request.orgName,
-                    job_id=request.job_id
+                    job_id=request.job_id,
+                    jd_file_path=jd_file_path
                 )
             else:
                 # Regular interview scheduling email
