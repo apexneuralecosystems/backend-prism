@@ -2461,11 +2461,13 @@ async def send_ai_interview_invitation_email(
     interview_link: str,
     round_name: str,
     org_name: str,
-    job_id: str
+    job_id: str,
+    jd_file_path: str = None
 ) -> bool:
     """
     Send AI interview invitation email to applicant.
     Emphasizes AI-conducted interview with technical requirements.
+    If jd_file_path is provided and exists, attaches the JD (PDF/DOCX) to the email.
     """
     try:
         from_email = os.getenv("FROM_EMAIL")
@@ -2727,14 +2729,23 @@ async def send_ai_interview_invitation_email(
         © 2024 PRISM - APEXNEURAL
         """
         
-        success = send_mail(
-            to_emails=applicant_email,
-            subject=subject,
-            message=message,
-            password=password,
-            from_email=from_email,
-            html_content=html_content
-        )
+        if jd_file_path and os.path.exists(jd_file_path):
+            success = send_email_with_attachment(
+                to_email=applicant_email,
+                subject=subject,
+                html_content=html_content,
+                attachment_path=jd_file_path,
+                attachment_name=os.path.basename(jd_file_path) or "Job_Description.pdf"
+            )
+        else:
+            success = send_mail(
+                to_emails=applicant_email,
+                subject=subject,
+                message=message,
+                password=password,
+                from_email=from_email,
+                html_content=html_content
+            )
         
         if success:
             print(f"✅ AI interview invitation email sent to {applicant_email}")
