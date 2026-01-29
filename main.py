@@ -2,12 +2,13 @@ from fastapi import FastAPI, HTTPException, Body, Depends, status, File, UploadF
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, EmailStr, Field, AliasChoices
+from typing import Optional, Dict, Any, Literal
 import os
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import random
@@ -36,6 +37,15 @@ from services.otp_service import generate_otp, store_otp, verify_otp
 from services.resume_parser import ResumeParser
 from services.comparator_agent import ComparatorAgent
 from services.payments import create_payment_order, capture_payment_order
+from services.razorpay_service import create_razorpay_order, verify_razorpay_signature
+from services.linkedin_service import (
+    save_social_credential,
+    get_active_access_token,
+    get_social_credential,
+    is_token_expired,
+    post_to_linkedin,
+    post_to_linkedin_with_document,
+)
 
 # Load environment variables
 backend_dir = Path(__file__).parent
@@ -193,6 +203,15 @@ print(f"🔗 Frontend base URL for shareable links: {_frontend_base} (FRONTEND_P
 if "localhost" in _frontend_base:
     print("⚠️ WARNING: Shareable links will use localhost. Set FRONTEND_PUBLIC_URL or FRONTEND_URL, or BACKEND_URL (e.g. https://prism.backend.apexneural.cloud) to derive it.")
 
+# LinkedIn OAuth (org-only) - state stored in memory for callback
+oauth_sessions: Dict[str, Dict[str, Any]] = {}
+LINKEDIN_CLIENT_ID = os.getenv("LINKEDIN_CLIENT_ID")
+LINKEDIN_CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET")
+LINKEDIN_REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI") or (os.getenv("BACKEND_URL", "").rstrip("/") + "/api/oauth/linkedin/callback")
+LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
+
 
 # Mount Static Files
 static_dir = backend_dir / "static"
@@ -225,11 +244,15 @@ def _read_text_from_static_file(static_dir: Path, relative_or_static_path: str) 
         return ""
     try:
         content = full.read_bytes()
-        from services.rag import extract_text_from_file
-        out = extract_text_from_file(content, full.name)
-        if out and not out.startswith("Error:"):
-            return out.strip()
-        # Fallback for PDF
+        # Try RAG extractor if available (supports PDF, DOCX, etc.)
+        try:
+            from services.rag import extract_text_from_file
+            out = extract_text_from_file(content, full.name)
+            if out and not out.startswith("Error:"):
+                return out.strip()
+        except ImportError:
+            pass
+        # Fallback: PDF via PyPDF2 or raw decode
         if full.suffix.lower() == ".pdf":
             pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
             return "\n".join((page.extract_text() or "") for page in pdf_reader.pages).strip()
@@ -259,10 +282,16 @@ class DemoRequest(BaseModel):
 
 class BuyCreditsRequest(BaseModel):
     num_credits: int  # Number of credits to buy (1 credit = $10)
+    payment_method: Literal["paypal", "razorpay"] = Field(
+        default="paypal",
+        validation_alias=AliasChoices("payment_method", "paymentMethod"),
+    )
 
 class CaptureOrderRequest(BaseModel):
     order_id: str
     org_email: str
+    payment_id: Optional[str] = None  # Razorpay payment_id for verify
+    signature: Optional[str] = None   # Razorpay signature for verify
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -1100,6 +1129,218 @@ async def get_organization_profile(current_user: dict = Depends(get_current_user
         )
 
 
+# ==================== LINKEDIN (ORG-ONLY) ENDPOINTS ====================
+
+def _generate_oauth_state() -> str:
+    """Generate a random state for OAuth."""
+    return str(uuid.uuid4()).replace("-", "")[:32]
+
+
+@app.get("/api/oauth/linkedin/connect")
+async def linkedin_connect(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Start LinkedIn OAuth (org owner only). Stores profile_id = org_email.
+    Returns authorization_url for frontend redirect.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can access this endpoint")
+    if not is_org_owner(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organization owners can connect LinkedIn")
+    if not LINKEDIN_CLIENT_ID or not LINKEDIN_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="LinkedIn OAuth not configured. Set LINKEDIN_CLIENT_ID and LINKEDIN_CLIENT_SECRET.",
+        )
+    profile_id = get_org_email(current_user)
+    state = _generate_oauth_state()
+    oauth_sessions[state] = {
+        "profile_id": profile_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "platform": "linkedin",
+    }
+    auth_params = {
+        "response_type": "code",
+        "client_id": LINKEDIN_CLIENT_ID,
+        "redirect_uri": LINKEDIN_REDIRECT_URI,
+        "scope": "openid profile email w_member_social",
+        "state": state,
+    }
+    auth_url = f"{LINKEDIN_AUTH_URL}?{urlencode(auth_params)}"
+    return {"success": True, "authorization_url": auth_url}
+
+
+@app.get("/api/oauth/linkedin/callback")
+async def linkedin_callback(code: str, state: str):
+    """
+    LinkedIn OAuth callback. Exchanges code for token and saves credential by profile_id (org email).
+    No auth required (called by LinkedIn redirect).
+    """
+    if state not in oauth_sessions:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired state. Please try connecting again.")
+    session_data = oauth_sessions.pop(state)
+    profile_id = session_data.get("profile_id")
+    if not profile_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid session.")
+
+    if not LINKEDIN_CLIENT_ID or not LINKEDIN_CLIENT_SECRET:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="LinkedIn OAuth not configured.")
+
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": LINKEDIN_REDIRECT_URI,
+        "client_id": LINKEDIN_CLIENT_ID,
+        "client_secret": LINKEDIN_CLIENT_SECRET,
+    }
+    token_response = requests.post(
+        LINKEDIN_TOKEN_URL,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=token_data,
+        timeout=10,
+    )
+    if token_response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"LinkedIn token exchange failed: {token_response.text}",
+        )
+    token_json = token_response.json()
+    access_token = token_json.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No access token in LinkedIn response.")
+
+    userinfo_response = requests.get(
+        LINKEDIN_USERINFO_URL,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )
+    user_data = userinfo_response.json() if userinfo_response.status_code == 200 else {}
+    expires_in = token_json.get("expires_in", 5184000)
+
+    save_social_credential(profile_id, "linkedin", {
+        "access_token": access_token,
+        "refresh_token": token_json.get("refresh_token"),
+        "expires_in": expires_in,
+        "platform_user_id": user_data.get("sub"),
+        "platform_username": user_data.get("name", "LinkedIn User"),
+        "platform_email": user_data.get("email"),
+    })
+
+    frontend_base = get_frontend_base_url()
+    redirect_url = f"{frontend_base}/organization-profile?linkedin_connected=1"
+    return RedirectResponse(url=redirect_url)
+
+
+@app.get("/api/oauth/linkedin/status")
+async def linkedin_status(current_user: dict = Depends(get_current_user)):
+    """
+    Return whether the organization's LinkedIn is connected (org only).
+    Uses org_email (owner's email) as profile_id.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can access this endpoint")
+    profile_id = get_org_email(current_user)
+    cred = get_social_credential(profile_id, "linkedin")
+    connected = cred is not None and not is_token_expired(cred)
+    return {"connected": connected}
+
+
+@app.post("/api/organization-jobpost/{job_id}/post-linkedin")
+async def post_job_to_linkedin(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Post an existing job to LinkedIn using the org owner's connected account (org only).
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can access this endpoint")
+
+    org_email = get_org_email(current_user)
+    access_token = get_active_access_token(org_email, "linkedin")
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connect LinkedIn first in your organization profile, then try again.",
+        )
+
+    # Find job in open or ongoing (same org)
+    job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        job = await ongoing_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    company_name = job.get("company", {}).get("name", "")
+    role = job.get("role", "")
+    location = job.get("location", "")
+    job_type = job.get("job_type", "full_time")
+    openings = job.get("number_of_openings", 1)
+    app_close = job.get("application_close_date", "")
+    notes = (job.get("notes") or "")[:500]
+    file_path = (job.get("file_path") or "").strip()
+
+    frontend_base = get_frontend_base_url()
+    job_url = f"{frontend_base}/jobs/{job_id}" if job_id else frontend_base
+
+    # Commentary text (same with or without document attach)
+    text_parts = [
+        "We're hiring!",
+        "",
+        f"Role: {role}",
+        f"Company: {company_name}",
+        f"Location: {location}",
+        f"Type: {job_type.replace('_', ' ').title()}",
+        f"Openings: {openings}",
+    ]
+    if app_close:
+        text_parts.append(f"Apply by: {app_close}")
+    if notes:
+        text_parts.append("")
+        text_parts.append(notes)
+    text_parts.append("")
+    text_parts.append(f"Apply here: {job_url}")
+    commentary = "\n".join(text_parts)
+
+    # Prefer posting with JD attached as document (LinkedIn Documents API)
+    result = None
+    if file_path:
+        # Resolve local JD file path (file_path is e.g. /static/files/jds/uuid.pdf)
+        jd_relative = file_path.strip().lstrip("/").replace("static/", "", 1) if file_path.startswith("/static") else file_path.lstrip("/")
+        local_jd_path = static_dir / jd_relative if jd_relative else None
+        if local_jd_path and local_jd_path.exists():
+            doc_title = f"JD_{role.replace(' ', '_')[:30]}.pdf" if role else "Job_Description.pdf"
+            result = post_to_linkedin_with_document(
+                access_token=access_token,
+                local_file_path=local_jd_path,
+                commentary=commentary,
+                document_title=doc_title,
+            )
+            if not result.get("success"):
+                print(f"[LinkedIn] Document post failed (will fallback to text+link): {result.get('error', '')}")
+
+    # Fallback: post with text and JD as link (try ARTICLE link card first, then text-only)
+    if not result or not result.get("success"):
+        jd_url_for_post = None
+        if file_path:
+            backend_base = (os.getenv("BACKEND_URL") or "http://localhost:5555").rstrip("/")
+            jd_url_for_post = f"{backend_base}{file_path}"
+            commentary_with_jd = commentary.replace("Apply here:", f"📎 Job description (PDF): {jd_url_for_post}\n\nApply here:")
+        else:
+            commentary_with_jd = commentary
+        result = post_to_linkedin(access_token=access_token, text=commentary_with_jd, article_url=jd_url_for_post)
+        if not result.get("success") and jd_url_for_post:
+            result = post_to_linkedin(access_token=access_token, text=commentary_with_jd)
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("error", "Failed to post to LinkedIn"),
+        )
+    return {"success": True, "message": "Job posted to LinkedIn", "post_id": result.get("post_id")}
+
+
 # ==================== ORGANIZATION MEMBERS ENDPOINTS ====================
 
 class InviteMemberRequest(BaseModel):
@@ -1682,7 +1923,8 @@ async def buy_credits(
     request: BuyCreditsRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Create payment order for buying credits (Org owner only)"""
+    """Create payment order for buying credits (Org owner only). Supports PayPal and Razorpay."""
+    print(f"[BUY_CREDITS] >>> Request hit this backend (localhost:5555 if you see this in local terminal)")
     try:
         # Only org owners can buy credits
         if current_user.get("user_type") != "organization":
@@ -1703,53 +1945,114 @@ async def buy_credits(
                 detail="Number of credits must be at least 1"
             )
         
-        # Calculate amount (1 credit = $10)
-        amount = request.num_credits * 10.0
+        # Calculate amount (1 credit = $10 USD)
+        amount_usd = request.num_credits * 10.0
         org_email = get_org_email(current_user)
-        
-        # Get frontend URL from env
         frontend_url = get_frontend_base_url()
-        
-        # Create PayPal order
-        result = await create_payment_order(
-            amount=amount,
-            currency="USD",
-            description=f"Purchase {request.num_credits} credit(s) for job postings",
-            return_url=f"{frontend_url}/payment/success",
-            cancel_url=f"{frontend_url}/payment/cancel"
-        )
-        
-        # Save payment record
-        payment_doc = {
-            "order_id": result["order_id"],
-            "paypal_order_id": result["paypal_order_id"],
-            "org_email": org_email,
-            "amount": amount,
-            "currency": "USD",
-            "num_credits": request.num_credits,
-            "status": "created",
-            "description": f"Purchase {request.num_credits} credit(s)",
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        
-        await payments_collection.insert_one(payment_doc)
-        
-        return {
-            "success": True,
-            "order_id": result["order_id"],
-            "approval_url": result["approval_url"],
-            "amount": amount,
-            "num_credits": request.num_credits
-        }
+        payment_method = getattr(request, "payment_method", None) or "paypal"
+        print(f"[BUY_CREDITS] payment_method={payment_method!r} num_credits={request.num_credits}")
+
+        if payment_method == "razorpay":
+            # Razorpay: amount in INR (paise). USD to INR rate from env.
+            usd_to_inr = float(os.getenv("USD_TO_INR_RATE", "83.0"))
+            amount_inr = amount_usd * usd_to_inr
+            amount_paise = int(round(amount_inr * 100))
+            receipt_id = f"credits_{uuid.uuid4().hex[:12]}"
+            razorpay_order = create_razorpay_order(
+                amount_paise=amount_paise,
+                currency="INR",
+                receipt=receipt_id,
+                notes={"num_credits": request.num_credits, "org_email": org_email},
+            )
+            order_id_razor = razorpay_order["id"]
+            payment_doc = {
+                "order_id": order_id_razor,
+                "payment_provider": "razorpay",
+                "razorpay_order_id": order_id_razor,
+                "org_email": org_email,
+                "amount": amount_inr,
+                "amount_paise": amount_paise,
+                "currency": "INR",
+                "num_credits": request.num_credits,
+                "status": "created",
+                "description": f"Purchase {request.num_credits} credit(s)",
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            await payments_collection.insert_one(payment_doc)
+            razorpay_key_id = os.getenv("RAZORPAY_KEY_ID")
+            if not razorpay_key_id:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Razorpay is not configured (RAZORPAY_KEY_ID missing)"
+                )
+            return {
+                "success": True,
+                "payment_method": "razorpay",
+                "order_id": order_id_razor,
+                "razorpay_order_id": order_id_razor,
+                "razorpay_key_id": razorpay_key_id,
+                "amount_paise": amount_paise,
+                "currency": "INR",
+                "amount": amount_inr,
+                "num_credits": request.num_credits,
+            }
+        else:
+            # PayPal
+            result = await create_payment_order(
+                amount=amount_usd,
+                currency="USD",
+                description=f"Purchase {request.num_credits} credit(s) for job postings",
+                return_url=f"{frontend_url}/payment/success",
+                cancel_url=f"{frontend_url}/payment/cancel"
+            )
+            payment_doc = {
+                "order_id": result["order_id"],
+                "payment_provider": "paypal",
+                "paypal_order_id": result["paypal_order_id"],
+                "org_email": org_email,
+                "amount": amount_usd,
+                "currency": "USD",
+                "num_credits": request.num_credits,
+                "status": "created",
+                "description": f"Purchase {request.num_credits} credit(s)",
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            await payments_collection.insert_one(payment_doc)
+            return {
+                "success": True,
+                "payment_method": "paypal",
+                "order_id": result["order_id"],
+                "approval_url": result["approval_url"],
+                "amount": amount_usd,
+                "num_credits": request.num_credits
+            }
     
     except HTTPException:
         raise
-    except Exception as e:
-        print(f"❌ Error creating credit purchase order: {e}")
+    except ValueError as e:
+        if "RAZORPAY" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Razorpay is not configured"
+            )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating payment order: {str(e)}"
+            detail=str(e)
+        )
+    except Exception as e:
+        err_msg = str(e)
+        print(f"❌ Error creating credit purchase order: {e}")
+        # Surface Razorpay/API errors so frontend can show them (e.g. invalid key)
+        if "razorpay" in err_msg.lower() or "invalid" in err_msg.lower() or "unauthorized" in err_msg.lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err_msg
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating payment order: {err_msg}"
         )
 
 @app.post("/api/payments/capture-order")
@@ -1757,7 +2060,7 @@ async def capture_order_endpoint(
     request: CaptureOrderRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """Capture payment and add credits to organization"""
+    """Capture payment and add credits to organization. Supports PayPal (capture) and Razorpay (verify)."""
     try:
         # Find payment record
         payment = await payments_collection.find_one({
@@ -1782,35 +2085,59 @@ async def capture_order_endpoint(
                 "total_credits": current_credits
             }
         
-        # Capture payment via PayPal
-        capture_result = await capture_payment_order(request.order_id)
-        
-        if capture_result.get("status") != "completed":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Payment capture failed: {capture_result.get('status')}"
+        payment_provider = payment.get("payment_provider", "paypal")
+        num_credits = payment.get("num_credits", 0)
+
+        if payment_provider == "razorpay":
+            # Razorpay: verify signature then mark completed and add credits
+            if not request.payment_id or not request.signature:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Razorpay payment requires payment_id and signature for verification"
+                )
+            if not verify_razorpay_signature(
+                order_id=request.order_id,
+                payment_id=request.payment_id,
+                signature=request.signature,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Razorpay signature verification failed"
+                )
+            await payments_collection.update_one(
+                {"order_id": request.order_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "razorpay_payment_id": request.payment_id,
+                        "updated_at": datetime.utcnow()
+                    }
+                }
+            )
+        else:
+            # PayPal: capture order
+            capture_result = await capture_payment_order(request.order_id)
+            if capture_result.get("status") != "completed":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Payment capture failed: {capture_result.get('status')}"
+                )
+            await payments_collection.update_one(
+                {"order_id": request.order_id},
+                {
+                    "$set": {
+                        "status": "completed",
+                        "paypal_capture_id": capture_result.get("capture_id"),
+                        "updated_at": datetime.utcnow()
+                    }
+                }
             )
         
-        # Update payment record
-        await payments_collection.update_one(
-            {"order_id": request.order_id},
-            {
-                "$set": {
-                    "status": "completed",
-                    "paypal_capture_id": capture_result.get("capture_id"),
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
-        
         # Add credits to organization owner's account
-        num_credits = payment.get("num_credits", 0)
         org_owner = await users_collection.find_one({"email": request.org_email})
-        
         if org_owner:
             current_credits = org_owner.get("credits", 0)
             new_credits = current_credits + num_credits
-            
             await users_collection.update_one(
                 {"email": request.org_email},
                 {
@@ -2654,166 +2981,124 @@ async def apply_for_job(
                 detail="Only candidates can apply for jobs"
             )
 
-        # Check if user has already applied
-        existing_job = await open_jobs_collection.find_one({
+        # Check if user has already applied (job-applied is source of truth)
+        applied_exists = await job_applied_collection.find_one({
             "job_id": job_id,
-            "applied_candidates.email": current_user["email"]
+            "email": current_user["email"]
         })
-
-        if existing_job:
+        if applied_exists:
+            print(f"⚠️ [APPLY] Already registered: {current_user['email']} for job {job_id}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="You have already applied for this job"
+                detail="Already registered"
             )
 
-        # Get job details to find organization and job description
+        # Get job details (must exist in open jobs to apply)
         job_details = await open_jobs_collection.find_one({"job_id": job_id})
         if not job_details:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found"
             )
-        
-        org_email = job_details.get("company", {}).get("email", "")
-        job_description = ""  # Will be extracted from JD file if available
-        
-        # Get user profile to fetch resume path and parsed resume data
+
+        # Get user profile for resume URL
         user_profile = await user_data_collection.find_one({"user_email": current_user["email"]})
-        
-        # Get resume_url from request body first, fallback to profile
         resume_url = application_data.get("resume_url", "")
         if not resume_url and user_profile:
             resume_url = user_profile.get("resumeUrl", "") or user_profile.get("resume_url", "")
-        
         print(f"📄 [APPLY] Resume URL for {current_user['email']}: {resume_url}")
 
         user_additional_details = (application_data.get("additional_details") or "").strip()
-        
         if not resume_url:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Resume not found. Please upload your resume in your profile before applying."
             )
-        
-        # Always parse resume freshly on each application for accurate matching
-        # This ensures LLM is called every time user applies
-        parsed_resume_data = None
+
+        # Resolve resume file path (under static): support /static/uploads/x, uploads/x, or full URL
+        resume_clean = (resume_url or "").strip()
+        if "://" in resume_clean:
+            resume_clean = resume_clean.split("://", 1)[1].split("/", 1)[-1] if "/" in resume_clean.split("://", 1)[1] else resume_clean
+        for prefix in ("/static/", "static/", "/"):
+            if resume_clean.startswith(prefix):
+                resume_clean = resume_clean[len(prefix):].lstrip("/")
+                break
+        resume_relative = resume_clean
+        resume_file_path = static_dir / resume_relative
+        if not resume_file_path.exists():
+            # Try uploads/ filename in case URL was stored as relative path only
+            if not resume_relative.startswith("uploads"):
+                alt_path = static_dir / "uploads" / (resume_relative.split("/")[-1] if "/" in resume_relative else resume_relative)
+                if alt_path.exists():
+                    resume_file_path = alt_path
+        if not resume_file_path.exists():
+            print(f"⚠️ [APPLY] Resume file not found: resolved={resume_file_path}, url={resume_url}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your resume file could not be found. Please re-upload your resume in your profile so we can run the evaluation."
+            )
+
+        # Parse resume with OpenAI and save to user profile
+        parser = ResumeParser()
         try:
-            print(f"🤖 [APPLY] Starting LLM resume parsing for {current_user['email']}...")
-            
-            # Read resume file from path
-            resume_path = static_dir / resume_url.lstrip("/static/")
-            if not resume_path.exists():
-                raise Exception(f"Resume file not found at path: {resume_path}")
-            
-            with open(resume_path, "rb") as f:
-                resume_content = f.read()
-            
-            parser = ResumeParser()
-            resume_text = parser.extract_text_from_pdf(resume_content)
+            resume_bytes = resume_file_path.read_bytes()
+            resume_text = parser.extract_text_from_pdf(resume_bytes)
+            if not resume_text or len(resume_text.strip()) < 10:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Could not extract text from your resume. Please ensure the PDF contains readable text."
+                )
             parsed_resume_data = parser.parse(resume_text)
-            
-            print(f"✅ [APPLY] LLM resume parsing completed successfully for {current_user['email']}!")
-            
-            # Save parsed data back to user profile
-            await user_data_collection.update_one(
-                {"user_email": current_user["email"]},
-                {"$set": {"parsed_resume_data": parsed_resume_data}}
+        except ValueError as e:
+            print(f"❌ [APPLY] Resume parse error: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Could not parse your resume. Please ensure the PDF contains readable text."
             )
         except Exception as e:
-            print(f"❌ [APPLY] Error parsing resume with LLM: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"❌ [APPLY] Resume parse error: {e}")
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to process resume with AI. Please ensure your resume is uploaded correctly. Error: {str(e)}"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Your resume could not be processed. Please re-upload a valid PDF."
             )
-        
-        # Prepare candidate data with resume URL
+
+        await user_data_collection.update_one(
+            {"user_email": current_user["email"]},
+            {"$set": {"parsed_resume_data": parsed_resume_data, "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
+
+        # JD text for comparator
+        jd_text = _read_text_from_static_file(static_dir, job_details.get("file_path", ""))
+        if not jd_text:
+            jd_text = f"""Job Role: {job_details.get('role', 'N/A')}
+Company: {job_details.get('company', {}).get('name', 'N/A')}
+Location: {job_details.get('location', 'N/A')}
+Notes: {job_details.get('notes', '')}"""
+
+        # Run comparator agent (AI evaluation) – empty employees list if no org employees
+        additional_info = {}
+        if user_additional_details:
+            additional_info["additional_details"] = user_additional_details
+        try:
+            comparator = ComparatorAgent(employees_data=[])
+            ai_evaluation = comparator.process(
+                candidate_data=parsed_resume_data,
+                job_description=jd_text,
+                additional_info=additional_info
+            )
+        except Exception as e:
+            print(f"⚠️ [APPLY] ComparatorAgent error (continuing without AI summary): {e}")
+            ai_evaluation = user_additional_details or ""
+
+        combined_details = (user_additional_details + "\n\n--- AI Evaluation ---\n" + ai_evaluation).strip() if user_additional_details else ai_evaluation
+
         candidate_data = {
             "name": application_data.get("name", current_user.get("name", "")),
             "email": current_user["email"],
-            "resume_url": resume_url
+            "resume_url": resume_url,
+            "additional_details": combined_details or ""
         }
-        
-        # Run comparator agent if we have parsed resume data and organization employees
-        additional_details = ""
-        if parsed_resume_data and org_email:
-            try:
-                print(f"🔍 [APPLY] Running comparator agent for {current_user['email']}...")
-                
-                # Get organization employees data
-                org_data = await organization_data_collection.find_one({"email": org_email})
-                employees_data = []
-                
-                if org_data and org_data.get("employees_details"):
-                    for emp in org_data["employees_details"]:
-                        if emp.get("parsed_resume_data"):
-                            employees_data.append(emp["parsed_resume_data"])
-                    print(f"📊 [APPLY] Found {len(employees_data)} employees for comparison")
-                
-                # Get job description from JD file if available
-                jd_file_path = job_details.get("file_path", "")
-                job_description = ""
-                if jd_file_path:
-                    try:
-                        jd_path = static_dir / jd_file_path.lstrip("/static/")
-                        if jd_path.exists():
-                            with open(jd_path, "rb") as f:
-                                jd_content = f.read()
-                            # Try to extract text from PDF
-                            try:
-                                pdf_reader = PyPDF2.PdfReader(io.BytesIO(jd_content))
-                                job_description = ""
-                                for page in pdf_reader.pages:
-                                    job_description += page.extract_text() + "\n"
-                                print(f"📄 [APPLY] Extracted JD from PDF")
-                            except:
-                                # If not PDF, try reading as text
-                                job_description = jd_content.decode('utf-8', errors='ignore')
-                                print(f"📄 [APPLY] Read JD as text file")
-                    except Exception as e:
-                        print(f"⚠️ [APPLY] Warning: Could not read JD file: {e}")
-                
-                # Run comparator agent if we have employees data
-                if employees_data:
-                    print(f"🚀 [APPLY] Starting comparator agent with {len(employees_data)} employees...")
-                    comparator = ComparatorAgent(employees_data)
-                    if job_description:
-                        print(f"📝 [APPLY] Running full comparison with JD and employees...")
-                        additional_details = comparator.process(
-                            candidate_data=parsed_resume_data,
-                            job_description=job_description,
-                            additional_info={}
-                        )
-                        print(f"✅ [APPLY] Comparator agent completed successfully!")
-                    else:
-                        print(f"📝 [APPLY] Running employee comparison only (no JD available)...")
-                        # If no JD, just compare with employees
-                        employee_comparison = comparator._compare_with_employees(parsed_resume_data)
-                        # Format just employee comparison
-                        from services.output_formatter import OutputFormatter
-                        formatter = OutputFormatter()
-                        additional_details = formatter.format(
-                            parsed_resume_data,
-                            employee_comparison,
-                            {"jd_relevance_score": 0, "ai_suggestion": "Job description not available"},
-                            {}
-                        )
-                        print(f"✅ [APPLY] Employee comparison completed successfully!")
-                else:
-                    print(f"⚠️ [APPLY] No employees data available for comparison")
-            except Exception as e:
-                print(f"❌ [APPLY] Error running comparator agent: {e}")
-                import traceback
-                traceback.print_exc()
-
-        combined_details = ""
-        if user_additional_details:
-            combined_details = f"Candidate provided details:\n{user_additional_details}"
-        if additional_details:
-            combined_details = f"{combined_details}\n\nAI assessment:\n{additional_details}" if combined_details else additional_details
-        candidate_data["additional_details"] = combined_details
         
         # Add candidate to applied_candidates array in open-jobs collection
         result = await open_jobs_collection.update_one(
@@ -2844,7 +3129,7 @@ async def apply_for_job(
 
         return {
             "success": True,
-            "message": "Successfully applied for the job"
+            "message": "Job applied"
         }
 
     except HTTPException:
@@ -2976,6 +3261,59 @@ async def get_user_applied_jobs(current_user: dict = Depends(get_current_user)):
         raise
     except Exception as e:
         print(f"❌ Error fetching applied jobs: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_single_job(
+    job_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get a single job by ID for candidates (Protected - users only).
+    Looks in open, then ongoing, then closed so users can view details
+    for jobs they applied to or that have moved past open.
+    """
+    try:
+        if current_user.get("user_type") != "user":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only candidates can view job details"
+            )
+        await move_expired_jobs_to_ongoing()
+        job = await open_jobs_collection.find_one({"job_id": job_id})
+        if job is not None:
+            job["job_status"] = "open"
+        else:
+            job = await ongoing_jobs_collection.find_one({"job_id": job_id})
+            if job is not None:
+                job["job_status"] = "ongoing"
+            else:
+                job = await closed_jobs_collection.find_one({"job_id": job_id})
+                if job is not None:
+                    job["job_status"] = "closed"
+        if not job:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found"
+            )
+        job["_id"] = str(job["_id"])
+        # Check if current user has already applied (for candidates)
+        user_has_applied = False
+        applied_doc = await job_applied_collection.find_one({
+            "job_id": job_id,
+            "email": current_user.get("email")
+        })
+        if applied_doc:
+            user_has_applied = True
+        return {"success": True, "job": job, "user_has_applied": user_has_applied}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching job {job_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)

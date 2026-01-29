@@ -52,3 +52,4 @@ pytz>=2024.1
 # Payment Processing
 apex-saas-framework
 asyncpg>=0.29.0  # Required for apex Client (even though we use MongoDB)
+razorpay>=1.4.0  # Razorpay SDK for INR payments

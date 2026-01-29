@@ -19,6 +19,8 @@ __pycache__/
 # ==================== CREDENTIALS ====================
 credentials.json
 token.json
+data/social_credentials/
+certs/*.pem
 
 # ==================== OS & EDITOR ====================
 .DS_Store
