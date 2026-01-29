@@ -4871,7 +4871,7 @@ async def create_review_request(
         review_link = f"{frontend_url}/review-form?review_id={review_id}"
 
         # Get backend base URL for resume link
-        backend_base = os.getenv("BACKEND_BASE_URL", "http://localhost:5555")
+        backend_base = os.getenv("BACKEND_URL", "http://localhost:5555")
         # Normalize resume_url - it might already have /static/ or might not
         normalized_resume_url = resume_url
         if resume_url:
