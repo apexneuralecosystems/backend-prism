@@ -1954,7 +1954,7 @@ async def buy_credits(
 
         if payment_method == "razorpay":
             # Razorpay: amount in INR (paise). USD to INR rate from env.
-            usd_to_inr = float(os.getenv("USD_TO_INR_RATE", "83.0"))
+            usd_to_inr = float(os.getenv("USD_TO_INR_RATE", "91.93"))
             amount_inr = amount_usd * usd_to_inr
             amount_paise = int(round(amount_inr * 100))
             receipt_id = f"credits_{uuid.uuid4().hex[:12]}"
