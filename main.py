@@ -1946,7 +1946,7 @@ async def buy_credits(
             )
         
         # Calculate amount (1 credit = $10 USD)
-        amount_usd = request.num_credits * 10.0
+        amount_usd = request.num_credits * 0.011
         org_email = get_org_email(current_user)
         frontend_url = get_frontend_base_url()
         payment_method = getattr(request, "payment_method", None) or "paypal"
