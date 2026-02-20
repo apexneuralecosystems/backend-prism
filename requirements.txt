@@ -120,7 +120,7 @@ python-docx>=1.1.0
 
 # Face/Eye/Person tracking (unified_eye_face_tracker): OpenCV, MediaPipe, YOLO
 opencv-python-headless>=4.8.0
-mediapipe>=0.10.0
+mediapipe==0.10.14
 numpy>=1.24.0,<2.0.0
 Pillow>=9.0.0
 PyYAML>=6.0

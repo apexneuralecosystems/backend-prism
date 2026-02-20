@@ -20,7 +20,11 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Install python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Verify MediaPipe installation (fail build if MediaPipe doesn't work)
+RUN python -c "import mediapipe as mp; assert hasattr(mp, 'solutions'), 'MediaPipe solutions not available'; print('✅ MediaPipe verified')"
 
 # Copy backend code
 COPY . .
