@@ -5,7 +5,13 @@ Modify this file to improve tracking; the process_video() API stays the same.
 """
 
 import cv2
-import mediapipe as mp
+try:
+    import mediapipe as mp
+    MEDIAPIPE_AVAILABLE = hasattr(mp, 'solutions')
+except (ImportError, AttributeError) as e:
+    print(f"❌ MediaPipe not available: {e}")
+    mp = None
+    MEDIAPIPE_AVAILABLE = False
 import numpy as np
 import subprocess
 import sys
@@ -48,6 +54,13 @@ class UnifiedEyeFacePersonTracker:
     """Exact UnifiedEyeFacePersonTracker - modify this class for better output."""
 
     def __init__(self):
+        if not MEDIAPIPE_AVAILABLE or mp is None:
+            raise RuntimeError(
+                "MediaPipe is not installed correctly. "
+                "Ensure Dockerfile includes: libgl1 libglib2.0-0 libgomp1. "
+                "Rebuild Docker image after updating Dockerfile."
+            )
+        
         # MediaPipe Face Mesh
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
