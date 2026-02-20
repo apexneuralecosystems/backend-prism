@@ -1,0 +1,148 @@
+# # Core Backend
+# fastapi==0.124.2
+# uvicorn[standard]==0.38.0
+# starlette==0.50.0
+
+# # Environment & Config
+# python-dotenv==1.2.1
+
+# # Validation & Auth
+# pydantic[email]==2.12.5
+# python-jose[cryptography]==3.3.0
+# passlib[bcrypt]==1.7.4
+# bcrypt==4.0.1
+# email-validator==2.3.0
+
+# # File Uploads
+# python-multipart==0.0.20
+
+# # Database
+# motor==3.7.1
+# pymongo==4.15.5
+# dnspython==2.8.0
+
+# # Async / Utils
+# anyio==4.12.0
+# typing-extensions==4.15.0
+
+# # AI / LLM
+# openai>=1.0.0
+# langchain==0.1.16
+# langchain-openai>=0.0.5
+
+# # PDFs & Requests
+# PyPDF2>=3.0.0
+# requests>=2.31.0
+# json5>=0.9.0
+
+# # AI Interview: WebRTC, WebM, transcripts, DOCX
+# av>=10.0.0
+# websockets>=12.0
+# python-docx>=1.1.0
+
+# # Face/Eye/Person tracking (unified_eye_face_tracker): OpenCV, MediaPipe, YOLO
+# opencv-python-headless>=4.8.0
+# mediapipe>=0.10.0
+# numpy>=1.24.0,<2.0.0
+# Pillow>=9.0.0
+# PyYAML>=6.0
+# scipy>=1.9.0
+
+# # YOLO (ultralytics) – person detection; installs torch/torchvision automatically
+# ultralytics>=8.0.0
+
+# # Google APIs
+# google-auth-oauthlib>=1.2.0
+# google-auth-httplib2>=0.2.0
+# google-api-python-client>=2.100.0
+# google-auth
+
+# # Date & Time
+# python-dateutil>=2.8.2
+# pytz>=2024.1
+
+# # AWS S3
+# boto3>=1.28.0
+
+# # Payment Processing
+# apex-saas-framework
+# asyncpg>=0.29.0  # Required for apex Client (even though we use MongoDB)
+# razorpay>=1.4.0  # Razorpay SDK for INR payments
+
+
+
+# CPU-only PyTorch (must be before ultralytics so YOLO uses CPU build)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Core Backend
+fastapi==0.124.2
+uvicorn[standard]==0.38.0
+starlette==0.50.0
+
+# Environment & Config
+python-dotenv==1.2.1
+
+# Validation & Auth
+pydantic[email]==2.12.5
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+email-validator==2.3.0
+
+# File Uploads
+python-multipart==0.0.20
+
+# Database
+motor==3.7.1
+pymongo==4.15.5
+dnspython==2.8.0
+
+# Async / Utils
+anyio==4.12.0
+typing-extensions==4.15.0
+
+# AI / LLM
+openai>=1.0.0
+langchain==0.1.16
+langchain-openai>=0.0.5
+
+# PDFs & Requests
+PyPDF2>=3.0.0
+requests>=2.31.0
+json5>=0.9.0
+
+# AI Interview: WebRTC, WebM, transcripts, DOCX
+av>=10.0.0
+websockets>=12.0
+python-docx>=1.1.0
+
+# Face/Eye/Person tracking (unified_eye_face_tracker): OpenCV, MediaPipe, YOLO
+opencv-python-headless>=4.8.0
+mediapipe>=0.10.0
+numpy>=1.24.0,<2.0.0
+Pillow>=9.0.0
+PyYAML>=6.0
+scipy>=1.9.0
+
+# YOLO (ultralytics) – person detection; uses torch/torchvision above (CPU)
+ultralytics>=8.0.0
+
+# Google APIs
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.100.0
+google-auth
+
+# Date & Time
+python-dateutil>=2.8.2
+pytz>=2024.1
+
+# AWS S3
+boto3>=1.28.0
+
+# Payment Processing
+apex-saas-framework
+asyncpg>=0.29.0  # Required for apex Client (even though we use MongoDB)
+razorpay>=1.4.0  # Razorpay SDK for INR payments

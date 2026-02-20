@@ -1,0 +1,42 @@
+# ==================== STATIC FILES & UPLOADS ====================
+# User-uploaded files (should not be in git)
+static/uploads/
+static/files/
+static/interviews/
+uploads/
+
+# ==================== CACHES ====================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ==================== ENVIRONMENT & SECRETS ====================
+.env
+.env.local
+.env.*.local
+
+# ==================== CREDENTIALS ====================
+credentials.json
+token.json
+data/social_credentials/
+certs/*.pem
+
+# ==================== OS & EDITOR ====================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ==================== FFMPEG (optional; do not push large binaries) ====================
+FFMPEG/
+ffmpeg-8.0.1/
+
+# ==================== ARCHIVES ====================
+deleted_files/
+auth-backend/
+*.log
+*.tmp
