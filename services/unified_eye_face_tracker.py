@@ -8,8 +8,10 @@ import cv2
 try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = hasattr(mp, 'solutions')
+    if not MEDIAPIPE_AVAILABLE:
+        print(f"❌ MediaPipe imported but missing 'solutions' attribute. Version: {getattr(mp, '__version__', 'unknown')}")
 except (ImportError, AttributeError) as e:
-    print(f"❌ MediaPipe not available: {e}")
+    print(f"❌ MediaPipe import failed: {e}")
     mp = None
     MEDIAPIPE_AVAILABLE = False
 import numpy as np
@@ -55,9 +57,15 @@ class UnifiedEyeFacePersonTracker:
 
     def __init__(self):
         if not MEDIAPIPE_AVAILABLE or mp is None:
+            import subprocess
+            try:
+                mp_version = subprocess.check_output(['pip', 'show', 'mediapipe'], stderr=subprocess.DEVNULL).decode()
+                print(f"MediaPipe package info:\n{mp_version}")
+            except:
+                pass
             raise RuntimeError(
                 "MediaPipe is not installed correctly. "
-                "Ensure Dockerfile includes: libgl1 libglib2.0-0 libgomp1. "
+                "Ensure Dockerfile includes: libgl1 libglib2.0-0 libgomp1 libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 python3-dev. "
                 "Rebuild Docker image after updating Dockerfile."
             )
         

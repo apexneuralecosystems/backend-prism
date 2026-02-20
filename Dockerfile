@@ -6,10 +6,14 @@ WORKDIR /app
 # Install system dependencies (build tools, ffmpeg, and MediaPipe dependencies)
 RUN apt-get update && apt-get install -y \
     build-essential \
+    python3-dev \
     ffmpeg \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
+    libgstreamer1.0-0 \
+    libgstreamer-plugins-base1.0-0 \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy dependency file first (better caching)
