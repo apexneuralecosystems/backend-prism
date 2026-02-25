@@ -148,4 +148,4 @@ asyncpg>=0.29.0  # Required for apex Client (even though we use MongoDB)
 razorpay>=1.4.0  # Razorpay SDK for INR payments
 
 # Salesforce integration (org-only: connect + push jobs to PRISM_Jobs__c)
-simple-salesforce>=2.6.0
+simple-salesforce>=1.12.0
