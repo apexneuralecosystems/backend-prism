@@ -51,6 +51,16 @@ from services.linkedin_service import (
     post_to_linkedin,
     post_to_linkedin_with_document,
 )
+from services.salesforce_service import (
+    save_salesforce_credential,
+    get_salesforce_credential,
+    delete_salesforce_credential,
+    refresh_salesforce_token,
+    ensure_prism_object_and_push,
+    ensure_prism_object_and_update,
+    SALESFORCE_AUTH_URL,
+    SALESFORCE_TOKEN_URL,
+)
 from services.s3_service import (
     upload_bytes_to_s3,
     upload_file_to_s3,
@@ -227,6 +237,11 @@ LINKEDIN_REDIRECT_URI = os.getenv("LINKEDIN_REDIRECT_URI") or (os.getenv("BACKEN
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
+
+# Salesforce OAuth (org-only)
+SF_CLIENT_ID = os.getenv("SF_CLIENT_ID")
+SF_CLIENT_SECRET = os.getenv("SF_CLIENT_SECRET")
+SF_REDIRECT_URI = os.getenv("SF_REDIRECT_URI") or (os.getenv("BACKEND_URL", "").rstrip("/") + "/api/oauth/salesforce/callback")
 
 
 # Mount Static Files
@@ -1519,6 +1534,19 @@ def _generate_oauth_state() -> str:
     return str(uuid.uuid4()).replace("-", "")[:32]
 
 
+def _generate_pkce_pair() -> tuple:
+    """
+    Generate a PKCE code_verifier and code_challenge (S256 method).
+    Returns (code_verifier, code_challenge).
+    """
+    import secrets as _secrets
+    import hashlib as _hashlib
+    code_verifier = _secrets.token_urlsafe(43)          # 43-128 chars, URL-safe
+    digest = _hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return code_verifier, code_challenge
+
+
 @app.get("/api/oauth/linkedin/connect")
 async def linkedin_connect(
     current_user: dict = Depends(get_current_user),
@@ -1727,6 +1755,288 @@ async def post_job_to_linkedin(
             detail=result.get("error", "Failed to post to LinkedIn"),
         )
     return {"success": True, "message": "Job posted to LinkedIn", "post_id": result.get("post_id")}
+
+
+# ==================== SALESFORCE (ORG-ONLY) ENDPOINTS ====================
+
+@app.get("/api/oauth/salesforce/connect")
+async def salesforce_connect(current_user: dict = Depends(get_current_user)):
+    """
+    Start Salesforce OAuth flow (org owner only).
+    Returns authorization_url for the frontend to redirect to.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can connect Salesforce")
+    if not is_org_owner(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organization owners can connect Salesforce")
+    if not SF_CLIENT_ID or not SF_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Salesforce OAuth not configured. Set SF_CLIENT_ID and SF_CLIENT_SECRET.",
+        )
+
+    profile_id = get_org_email(current_user)
+    state = _generate_oauth_state()
+    code_verifier, code_challenge = _generate_pkce_pair()
+    oauth_sessions[state] = {
+        "profile_id": profile_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "platform": "salesforce",
+        "code_verifier": code_verifier,
+    }
+    params = {
+        "response_type": "code",
+        "client_id": SF_CLIENT_ID,
+        "redirect_uri": SF_REDIRECT_URI,
+        "scope": "api refresh_token",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"{SALESFORCE_AUTH_URL}?{urlencode(params)}"
+    return {"success": True, "authorization_url": auth_url}
+
+
+@app.get("/api/oauth/salesforce/callback")
+async def salesforce_callback(code: str, state: str):
+    """
+    Salesforce OAuth callback. Exchanges authorization code for tokens.
+    No auth required — called by Salesforce redirect.
+    """
+    if state not in oauth_sessions:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired state. Please try connecting again.")
+    session_data = oauth_sessions.pop(state)
+    profile_id = session_data.get("profile_id")
+    if not profile_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid session.")
+
+    if not SF_CLIENT_ID or not SF_CLIENT_SECRET:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Salesforce OAuth not configured.")
+
+    token_body: Dict[str, Any] = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": SF_REDIRECT_URI,
+        "client_id": SF_CLIENT_ID,
+        "client_secret": SF_CLIENT_SECRET,
+    }
+    # Include PKCE code_verifier if it was used during the authorization request
+    if session_data.get("code_verifier"):
+        token_body["code_verifier"] = session_data["code_verifier"]
+
+    token_resp = requests.post(
+        SALESFORCE_TOKEN_URL,
+        data=token_body,
+        timeout=15,
+    )
+    if token_resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Salesforce token exchange failed: {token_resp.text}",
+        )
+
+    token_data = token_resp.json()
+    if not token_data.get("access_token"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No access token in Salesforce response.")
+
+    save_salesforce_credential(profile_id, token_data)
+
+    frontend_base = get_frontend_base_url()
+    return RedirectResponse(url=f"{frontend_base}/organization-profile?salesforce_connected=1")
+
+
+@app.get("/api/oauth/salesforce/status")
+async def salesforce_status(current_user: dict = Depends(get_current_user)):
+    """Return whether the organization's Salesforce is connected (org only)."""
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can access this endpoint")
+    profile_id = get_org_email(current_user)
+    cred = get_salesforce_credential(profile_id)
+    connected = cred is not None and bool(cred.get("access_token"))
+    return {"connected": connected}
+
+
+@app.post("/api/organization-jobpost/{job_id}/push-salesforce")
+async def push_job_to_salesforce(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Push a job's full data (including all candidate details) to Salesforce
+    as a PRISM_Jobs__c record. Creates the custom object/field if absent.
+    Only org members can call; owner must have connected Salesforce.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can push to Salesforce")
+
+    org_email = get_org_email(current_user)
+    cred = get_salesforce_credential(org_email)
+    if not cred or not cred.get("access_token"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Salesforce not connected. Please connect Salesforce in your Organization Profile first.",
+        )
+
+    # Search across all job collections (closed first, then ongoing, then open)
+    job = await closed_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    job_collection_name = "closed-jobs"
+    if not job:
+        job = await ongoing_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+        job_collection_name = "ongoing-jobs"
+    if not job:
+        job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+        job_collection_name = "open-jobs"
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # If already pushed, we will UPDATE the existing Salesforce record with fresh data
+    # (handles the case where first push created an empty record due to propagation lag,
+    # and also keeps Salesforce records up-to-date when re-pushed)
+    existing_record_id = job.get("salesforce_record_id") if job.get("salesforce_pushed") else None
+
+    # Gather full candidate data
+    applied_candidates_payload = []
+    for candidate in job.get("applied_candidates") or []:
+        candidate_email = candidate.get("email")
+
+        # Full application record from job-applied collection
+        applied_record = await job_applied_collection.find_one({
+            "job_id": job_id,
+            "email": candidate_email,
+        })
+
+        # Full user profile from user_data collection
+        user_profile = await user_data_collection.find_one({"email": candidate_email})
+
+        # Build profile info block
+        profile_info: Dict[str, Any] = {}
+        if user_profile:
+            user_profile.pop("_id", None)
+            parsed = user_profile.get("parsed_resume_data") or {}
+            profile_info = {
+                "phone": user_profile.get("phone") or parsed.get("Number"),
+                "location": user_profile.get("location") or parsed.get("Location"),
+                "gender": user_profile.get("gender"),
+                "date_of_birth": user_profile.get("date_of_birth"),
+                "education": parsed.get("Education", []),
+                "experience": parsed.get("Experience", []),
+                "projects": parsed.get("Projects", []),
+                "skills": parsed.get("Skills", []),
+                "certifications": parsed.get("Certifications", []),
+                "languages": parsed.get("Languages", []),
+                "achievements": parsed.get("Achievements", []),
+            }
+
+        # Split additional_details into form data and AI evaluation text.
+        # The combined string is stored as: "<form data>\n\n--- AI Evaluation ---\n<eval text>"
+        raw_additional = candidate.get("additional_details") or ""
+        ai_eval_separator = "--- AI Evaluation ---"
+        if ai_eval_separator in raw_additional:
+            parts = raw_additional.split(ai_eval_separator, 1)
+            clean_additional = parts[0].strip()
+            extracted_ai_eval = parts[1].strip() if len(parts) > 1 else None
+        else:
+            clean_additional = raw_additional.strip()
+            extracted_ai_eval = None
+
+        candidate_status = (applied_record.get("status") if applied_record else None) or candidate.get("status")
+
+        candidate_entry: Dict[str, Any] = {
+            "name": candidate.get("name"),
+            "email": candidate_email,
+            "resume_url": candidate.get("resume_url"),
+            "additional_details": clean_additional,
+            "profile_info": profile_info,
+            # ai_evaluation: prefer dedicated DB field; fall back to text parsed from additional_details
+            "ai_evaluation": extracted_ai_eval,
+        }
+
+        if applied_record:
+            applied_record.pop("_id", None)
+            db_ai_eval = applied_record.get("ai_evaluation")
+            if db_ai_eval:
+                candidate_entry["ai_evaluation"] = db_ai_eval
+            candidate_entry["previous_rounds"] = applied_record.get("previous_rounds", [])
+            candidate_entry["ongoing_rounds"] = applied_record.get("ongoing_rounds", [])
+            candidate_entry["applied_at"] = str(applied_record.get("applied_at", ""))
+
+        # status goes last for readability in the Salesforce record
+        candidate_entry["status"] = candidate_status
+
+        applied_candidates_payload.append(candidate_entry)
+
+    # Build job payload
+    min_pkg = job.get("min_package") or 0
+    max_pkg = job.get("max_package") or 0
+    if min_pkg or max_pkg:
+        package_str = f"{min_pkg}-{max_pkg}"
+    else:
+        package_str = str(job.get("package") or "")
+
+    job_payload: Dict[str, Any] = {
+        "role": job.get("role"),
+        "posted_by": job.get("company", {}).get("name"),
+        "location": job.get("location"),
+        "jd_link": job.get("file_path"),
+        "when_posted": str(job.get("created_at", "")),
+        "no_of_openings": job.get("number_of_openings"),
+        "job_package": package_str,
+        "job_type": job.get("job_type"),
+        "apply_by": str(job.get("application_close_date", "")),
+        "notes": job.get("notes"),
+        "applied_candidates": applied_candidates_payload,
+    }
+
+    record_name = f"{job.get('role', 'Unknown Role')} ({job_id})"
+
+    access_token = cred["access_token"]
+    instance_url = cred.get("instance_url", "")
+
+    if existing_record_id:
+        # UPDATE the existing Salesforce record so we don't create duplicates
+        result = ensure_prism_object_and_update(access_token, instance_url, job_payload, existing_record_id)
+    else:
+        result = ensure_prism_object_and_push(access_token, instance_url, job_payload, record_name)
+
+    # Retry once with refreshed token on authentication failure
+    if not result["success"] and SF_CLIENT_ID and SF_CLIENT_SECRET:
+        new_token = refresh_salesforce_token(org_email, SF_CLIENT_ID, SF_CLIENT_SECRET)
+        if new_token:
+            if existing_record_id:
+                result = ensure_prism_object_and_update(new_token, instance_url, job_payload, existing_record_id)
+            else:
+                result = ensure_prism_object_and_push(new_token, instance_url, job_payload, record_name)
+
+    if not result["success"]:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=result.get("error", "Failed to push to Salesforce"),
+        )
+
+    # Mark job as pushed in MongoDB
+    target_collection = {
+        "closed-jobs": closed_jobs_collection,
+        "ongoing-jobs": ongoing_jobs_collection,
+        "open-jobs": open_jobs_collection,
+    }[job_collection_name]
+
+    await target_collection.update_one(
+        {"job_id": job_id},
+        {
+            "$set": {
+                "salesforce_pushed": True,
+                "salesforce_record_id": result.get("record_id"),
+                "salesforce_pushed_at": datetime.utcnow().isoformat() + "Z",
+            }
+        },
+    )
+
+    action = "updated" if existing_record_id else "pushed"
+    return {
+        "success": True,
+        "message": f"Job data {action} in Salesforce successfully",
+        "record_id": result.get("record_id"),
+    }
 
 
 # ==================== ORGANIZATION MEMBERS ENDPOINTS ====================

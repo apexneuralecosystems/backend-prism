@@ -89,7 +89,7 @@ class UnifiedEyeFacePersonTracker:
         # ========== EYE BLINK DETECTION ==========
         self.LEFT_EYE_BLINK = [33, 160, 158, 133, 153, 144]
         self.RIGHT_EYE_BLINK = [362, 385, 387, 263, 373, 380]
-        self.EAR_THRESHOLD = 0.23
+        self.EAR_THRESHOLD = 0.19  # Lower so "light open" eyes count as open
 
         # ========== EYE GAZE DETECTION ==========
         self.LEFT_IRIS = [474, 475, 476, 477]
@@ -401,7 +401,8 @@ class UnifiedEyeFacePersonTracker:
             cv2.polylines(frame, [np.array(left_points)], True, (128, 128, 128), 1)
             cv2.polylines(frame, [np.array(right_points)], True, (128, 128, 128), 1)
 
-            if avg_ear < self.EAR_THRESHOLD:
+            # Only "closed" when BOTH eyes below threshold (avoids "light open" → closed)
+            if left_ear < self.EAR_THRESHOLD and right_ear < self.EAR_THRESHOLD:
                 eye_status = "EYES CLOSED"
                 eye_color = (0, 0, 255)
             else:
