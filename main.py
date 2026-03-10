@@ -2616,6 +2616,13 @@ async def resend_invitation(
 
 # ==================== PAYMENT ENDPOINTS ====================
 
+@app.get("/api/payments/config")
+async def get_payments_config():
+    """Return public payment config (credit price in USD) from env for UI display."""
+    credit_price_usd = float(os.getenv("CREDIT_PRICE_USD", "1.0"))
+    return {"credit_price_usd": credit_price_usd}
+
+
 @app.post("/api/payments/buy-credits")
 async def buy_credits(
     request: BuyCreditsRequest,
@@ -2643,8 +2650,9 @@ async def buy_credits(
                 detail="Number of credits must be at least 1"
             )
         
-        # Calculate amount (1 credit = $10 USD)
-        amount_usd = request.num_credits * 0.011
+        # Calculate amount using env-based credit price (default 1 USD per credit)
+        credit_price_usd = float(os.getenv("CREDIT_PRICE_USD", "1.0"))
+        amount_usd = request.num_credits * credit_price_usd
         org_email = get_org_email(current_user)
         frontend_url = get_frontend_base_url()
         payment_method = getattr(request, "payment_method", None) or "paypal"
