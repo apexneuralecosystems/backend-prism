@@ -26,6 +26,10 @@ import pytz
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from docx import Document
+from docx.shared import Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx2pdf import convert as docx2pdf_convert
 
 # Import services
 from services.email_service import send_demo_request_email, send_interview_form_email, send_interview_feedback_form_email
@@ -878,7 +882,10 @@ async def verify_otp_and_create_user(data: dict = Body(...)):
             "name": name,
             "user_type": user_type,
             "is_verified": True,
-            "credits": 1,  # Default credits for new users
+            # Job-post credits (existing system)
+            "credits": 1,
+            # Separate AI interview credits (1 free AI interview for new orgs)
+            "ai_interview_credits": 1 if user_type == "organization" else 0,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
@@ -1859,6 +1866,7 @@ async def salesforce_status(current_user: dict = Depends(get_current_user)):
 @app.post("/api/organization-jobpost/{job_id}/push-salesforce")
 async def push_job_to_salesforce(
     job_id: str,
+    dry_run: bool = False,
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -1989,12 +1997,29 @@ async def push_job_to_salesforce(
 
     record_name = f"{job.get('role', 'Unknown Role')} ({job_id})"
 
+    # Allow frontend to download the exact payload without pushing to Salesforce
+    if dry_run:
+        return {
+            "success": True,
+            "already_pushed": bool(existing_record_id),
+            "job_payload": job_payload,
+        }
+
     access_token = cred["access_token"]
     instance_url = cred.get("instance_url", "")
 
+    def _has_entity_deleted_error(res: Dict[str, Any]) -> bool:
+        """Check if Salesforce returned ENTITY_IS_DELETED error."""
+        err = (res.get("error") or "") if isinstance(res, dict) else ""
+        return "ENTITY_IS_DELETED" in err.upper()
+
+    # First attempt: use existing_record_id when present to avoid duplicates
     if existing_record_id:
-        # UPDATE the existing Salesforce record so we don't create duplicates
         result = ensure_prism_object_and_update(access_token, instance_url, job_payload, existing_record_id)
+        # If the record was deleted in Salesforce, fall back to creating a fresh one
+        if not result["success"] and _has_entity_deleted_error(result):
+            existing_record_id = None
+            result = ensure_prism_object_and_push(access_token, instance_url, job_payload, record_name)
     else:
         result = ensure_prism_object_and_push(access_token, instance_url, job_payload, record_name)
 
@@ -2004,6 +2029,10 @@ async def push_job_to_salesforce(
         if new_token:
             if existing_record_id:
                 result = ensure_prism_object_and_update(new_token, instance_url, job_payload, existing_record_id)
+                # Again, if the record was deleted in Salesforce, create a new one
+                if not result["success"] and _has_entity_deleted_error(result):
+                    existing_record_id = None
+                    result = ensure_prism_object_and_push(new_token, instance_url, job_payload, record_name)
             else:
                 result = ensure_prism_object_and_push(new_token, instance_url, job_payload, record_name)
 
@@ -2036,6 +2065,7 @@ async def push_job_to_salesforce(
         "success": True,
         "message": f"Job data {action} in Salesforce successfully",
         "record_id": result.get("record_id"),
+        "already_pushed": bool(existing_record_id),
     }
 
 
@@ -2618,9 +2648,13 @@ async def resend_invitation(
 
 @app.get("/api/payments/config")
 async def get_payments_config():
-    """Return public payment config (credit price in USD) from env for UI display."""
+    """Return public payment config (credit prices in USD) from env for UI display."""
     credit_price_usd = float(os.getenv("CREDIT_PRICE_USD", "1.0"))
-    return {"credit_price_usd": credit_price_usd}
+    ai_interview_credit_price_usd = float(os.getenv("AI_INTERVIEW_CREDIT_PRICE_USD", "1.0"))
+    return {
+        "credit_price_usd": credit_price_usd,
+        "ai_interview_credit_price_usd": ai_interview_credit_price_usd,
+    }
 
 
 @app.post("/api/payments/buy-credits")
@@ -2658,6 +2692,8 @@ async def buy_credits(
         payment_method = getattr(request, "payment_method", None) or "paypal"
         print(f"[BUY_CREDITS] payment_method={payment_method!r} num_credits={request.num_credits}")
 
+        credit_type = "job_post"
+
         if payment_method == "razorpay":
             # Razorpay: amount in INR (paise). USD to INR rate from env.
             usd_to_inr = float(os.getenv("USD_TO_INR_RATE", "91.93"))
@@ -2680,6 +2716,7 @@ async def buy_credits(
                 "amount_paise": amount_paise,
                 "currency": "INR",
                 "num_credits": request.num_credits,
+                "credit_type": credit_type,
                 "status": "created",
                 "description": f"Purchase {request.num_credits} credit(s)",
                 "created_at": datetime.utcnow(),
@@ -2702,6 +2739,7 @@ async def buy_credits(
                 "currency": "INR",
                 "amount": amount_inr,
                 "num_credits": request.num_credits,
+                "credit_type": credit_type,
             }
         else:
             # PayPal
@@ -2761,6 +2799,161 @@ async def buy_credits(
             detail=f"Error creating payment order: {err_msg}"
         )
 
+
+@app.post("/api/payments/buy-ai-credits")
+async def buy_ai_credits(
+    request: BuyCreditsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Create payment order for buying AI interview credits (Org owner only).
+    Uses separate AI_INTERVIEW_CREDIT_PRICE_USD from env.
+    """
+    print(f"[BUY_AI_CREDITS] >>> Request hit this backend")
+    try:
+        # Only org owners can buy credits
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can buy AI interview credits",
+            )
+
+        if not is_org_owner(current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organization owners can purchase AI interview credits",
+            )
+
+        if request.num_credits < 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Number of credits must be at least 1",
+            )
+
+        # Calculate amount using env-based AI interview credit price
+        ai_credit_price_usd = float(os.getenv("AI_INTERVIEW_CREDIT_PRICE_USD", "1.0"))
+        amount_usd = request.num_credits * ai_credit_price_usd
+        org_email = get_org_email(current_user)
+        frontend_url = get_frontend_base_url()
+        payment_method = getattr(request, "payment_method", None) or "paypal"
+        print(
+            f"[BUY_AI_CREDITS] payment_method={payment_method!r} num_credits={request.num_credits}"
+        )
+
+        credit_type = "ai_interview"
+
+        if payment_method == "razorpay":
+            # Razorpay: amount in INR (paise). USD to INR rate from env.
+            usd_to_inr = float(os.getenv("USD_TO_INR_RATE", "91.93"))
+            amount_inr = amount_usd * usd_to_inr
+            amount_paise = int(round(amount_inr * 100))
+            receipt_id = f"ai_credits_{uuid.uuid4().hex[:12]}"
+            razorpay_order = create_razorpay_order(
+                amount_paise=amount_paise,
+                currency="INR",
+                receipt=receipt_id,
+                notes={
+                    "num_credits": request.num_credits,
+                    "org_email": org_email,
+                    "credit_type": credit_type,
+                },
+            )
+            order_id_razor = razorpay_order["id"]
+            payment_doc = {
+                "order_id": order_id_razor,
+                "payment_provider": "razorpay",
+                "razorpay_order_id": order_id_razor,
+                "org_email": org_email,
+                "amount": amount_inr,
+                "amount_paise": amount_paise,
+                "currency": "INR",
+                "num_credits": request.num_credits,
+                "credit_type": credit_type,
+                "status": "created",
+                "description": f"Purchase {request.num_credits} AI interview credit(s)",
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            await payments_collection.insert_one(payment_doc)
+            razorpay_key_id = os.getenv("RAZORPAY_KEY_ID")
+            if not razorpay_key_id:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Razorpay is not configured (RAZORPAY_KEY_ID missing)",
+                )
+            return {
+                "success": True,
+                "payment_method": "razorpay",
+                "order_id": order_id_razor,
+                "razorpay_order_id": order_id_razor,
+                "razorpay_key_id": razorpay_key_id,
+                "amount_paise": amount_paise,
+                "currency": "INR",
+                "amount": amount_inr,
+                "num_credits": request.num_credits,
+            }
+        else:
+            # PayPal
+            result = await create_payment_order(
+                amount=amount_usd,
+                currency="USD",
+                description=f"Purchase {request.num_credits} AI interview credit(s)",
+                return_url=f"{frontend_url}/payment/success",
+                cancel_url=f"{frontend_url}/payment/cancel",
+            )
+            payment_doc = {
+                "order_id": result["order_id"],
+                "payment_provider": "paypal",
+                "paypal_order_id": result["paypal_order_id"],
+                "org_email": org_email,
+                "amount": amount_usd,
+                "currency": "USD",
+                "num_credits": request.num_credits,
+                "credit_type": credit_type,
+                "status": "created",
+                "description": f"Purchase {request.num_credits} AI interview credit(s)",
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            await payments_collection.insert_one(payment_doc)
+            return {
+                "success": True,
+                "payment_method": "paypal",
+                "order_id": result["order_id"],
+                "approval_url": result["approval_url"],
+                "amount": amount_usd,
+                "num_credits": request.num_credits,
+            }
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        if "RAZORPAY" in str(e):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Razorpay is not configured",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e),
+        )
+    except Exception as e:
+        err_msg = str(e)
+        print(f"❌ Error creating AI credit purchase order: {e}")
+        if (
+            "razorpay" in err_msg.lower()
+            or "invalid" in err_msg.lower()
+            or "unauthorized" in err_msg.lower()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=err_msg,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creating AI credit payment order: {err_msg}",
+        )
+
 @app.post("/api/payments/capture-order")
 async def capture_order_endpoint(
     request: CaptureOrderRequest,
@@ -2781,18 +2974,30 @@ async def capture_order_endpoint(
             )
         
         if payment.get("status") == "completed":
-            # Get current credits
+            # Return what was purchased and current balance for that type
             org_owner = await users_collection.find_one({"email": request.org_email})
-            current_credits = org_owner.get("credits", 0) if org_owner else 0
+            if not org_owner:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Organization owner not found"
+                )
+            completed_credit_type = payment.get("credit_type", "job_post")
+            num_added = payment.get("num_credits", 0)
+            if completed_credit_type == "ai_interview":
+                total_credits = org_owner.get("ai_interview_credits", 0)
+            else:
+                total_credits = org_owner.get("credits", 0)
             return {
                 "success": True,
                 "message": "Payment already completed",
-                "credits_added": payment.get("num_credits", 0),
-                "total_credits": current_credits
+                "credits_added": num_added,
+                "total_credits": total_credits,
+                "credit_type": completed_credit_type,
             }
         
         payment_provider = payment.get("payment_provider", "paypal")
         num_credits = payment.get("num_credits", 0)
+        credit_type = payment.get("credit_type", "job_post")
 
         if payment_provider == "razorpay":
             # Razorpay: verify signature then mark completed and add credits
@@ -2841,29 +3046,41 @@ async def capture_order_endpoint(
         
         # Add credits to organization owner's account
         org_owner = await users_collection.find_one({"email": request.org_email})
-        if org_owner:
-            current_credits = org_owner.get("credits", 0)
-            new_credits = current_credits + num_credits
-            await users_collection.update_one(
-                {"email": request.org_email},
-                {
-                    "$set": {
-                        "credits": new_credits,
-                        "updated_at": datetime.utcnow()
-                    }
-                }
-            )
-        else:
+        if not org_owner:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Organization owner not found"
             )
-        
+
+        # Decide which credit bucket to increment
+        if credit_type == "ai_interview":
+            current_ai_credits = org_owner.get("ai_interview_credits", 0)
+            new_ai_credits = current_ai_credits + num_credits
+            update_fields = {
+                "ai_interview_credits": new_ai_credits,
+                "updated_at": datetime.utcnow(),
+            }
+            total_credits = new_ai_credits
+        else:
+            current_credits = org_owner.get("credits", 0)
+            new_credits = current_credits + num_credits
+            update_fields = {
+                "credits": new_credits,
+                "updated_at": datetime.utcnow(),
+            }
+            total_credits = new_credits
+
+        await users_collection.update_one(
+            {"email": request.org_email},
+            {"$set": update_fields},
+        )
+
         return {
             "success": True,
             "message": "Payment captured and credits added successfully",
             "credits_added": num_credits,
-            "total_credits": new_credits
+            "total_credits": total_credits,
+            "credit_type": credit_type,
         }
     
     except HTTPException:
@@ -2897,10 +3114,12 @@ async def get_organization_credits(
             )
         
         credits = org_owner.get("credits", 0)
+        ai_credits = org_owner.get("ai_interview_credits", 0)
         
         return {
             "success": True,
             "credits": credits,
+            "ai_interview_credits": ai_credits,
             "org_email": org_email
         }
     
@@ -4455,6 +4674,25 @@ async def send_interview_form(
                 detail="Only organizations can access this endpoint"
             )
         
+        # Get organization owner (for credits)
+        org_email = get_org_email(current_user)
+        org_owner = await users_collection.find_one({"email": org_email})
+        if not org_owner:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Organization not found"
+            )
+
+        # Check if this is an AI interview and enforce AI interview credits
+        is_ai_interview = getattr(request, "is_ai_interview", False)
+        if is_ai_interview:
+            ai_credits = org_owner.get("ai_interview_credits", 0)
+            if ai_credits < 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Insufficient AI interview credits. Please purchase AI interview credits."
+                )
+        
         # Get frontend URL from environment (shareable links: AI interview, schedule-interview)
         frontend_url = get_frontend_base_url()
         # Check candidate's current status
@@ -4466,7 +4704,6 @@ async def send_interview_form(
         candidate_status = applicant_doc.get("status") if applicant_doc else None
         
         # If scheduling an AI interview: same job, same person — no two AI interviews
-        is_ai_interview = getattr(request, 'is_ai_interview', False)
         if is_ai_interview:
             existing_ai = await interview_feedback_collection.find_one({
                 "job_id": request.job_id,
@@ -4608,6 +4845,20 @@ async def send_interview_form(
             
             if not success:
                 print(f"⚠️ Warning: Email sending failed for {request.applicantEmail}, but status has been updated")
+            else:
+                # On successful AI interview invitation, deduct 1 AI interview credit
+                if is_ai_interview:
+                    ai_credits = org_owner.get("ai_interview_credits", 0)
+                    new_ai_credits = max(0, ai_credits - 1)
+                    await users_collection.update_one(
+                        {"email": org_email},
+                        {
+                            "$set": {
+                                "ai_interview_credits": new_ai_credits,
+                                "updated_at": datetime.utcnow(),
+                            }
+                        },
+                    )
         except Exception as e:
             print(f"❌ Error sending interview form email: {e}")
             print(f"⚠️ Warning: Email sending failed for {request.applicantEmail}, but status has been updated")
@@ -5539,6 +5790,340 @@ async def send_offer_letter(
         raise
     except Exception as e:
         print(f"❌ Error sending offer letter: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error sending offer letter: {str(e)}"
+        )
+
+
+class AutoOfferRequest(BaseModel):
+    applicantEmail: EmailStr
+    applicantName: str
+    orgEmail: EmailStr
+    orgName: str
+    job_id: str
+
+    start_date: str
+    end_date: Optional[str] = None
+    duration: str
+    annual_ctc: str
+    currency: str
+    pay_frequency: str
+    benefits: str
+
+
+def _build_offer_docx_from_template(
+    template_path: Path,
+    request: AutoOfferRequest,
+    job_role: str,
+    org_data: Optional[Dict[str, Any]] = None,
+    employment_type: Optional[str] = None,
+) -> Path:
+    """Fill Offer_Letter_Template.docx with request, job, and org data.
+    DOCX must use these exact placeholder strings (curly or bracket style):
+    Company: {{COMPANY_NAME}} / [COMPANY NAME] / [Company Name], [Company Address...], [Phone], [HR Phone Number], [www.company.com]
+    Job: Ref: job id -> Ref: <job_id>, [Job Title], [Full-Time / Part-Time / Contract]
+    Candidate: [Candidate Full Name], [Candidate First Name], [candidate@email.com]
+    Dates: [DD Month YYYY] (end date or Permanent), [e.g., 12 months / Permanent...], [e.g., ₹X,XX,XXX per annum...], [Monthly / Bi-weekly / Weekly], [Health Insurance, PF...]
+    """
+    doc = Document(str(template_path))
+
+    # Basic pieces
+    first_name = (request.applicantName or "").split()[0] if request.applicantName else ""
+    today_str = datetime.utcnow().strftime("%B %d, %Y")
+
+    org_name = request.orgName or (org_data or {}).get("name", "")
+    org_location = (org_data or {}).get("location", "")
+    org_phone = (org_data or {}).get("number", "")
+    org_website = (org_data or {}).get("website", "")
+    employment = employment_type or ""
+
+    # Format end date nicely if provided; else treat as \"Not mentioned\" when empty
+    end_formatted = ""
+    if request.end_date:
+        try:
+            end_dt = datetime.fromisoformat(request.end_date)
+            end_formatted = end_dt.strftime("%d %B %Y")
+        except Exception:
+            end_formatted = request.end_date
+    else:
+        end_formatted = "Not mentioned"
+
+    # Mapping supports both {{PLACEHOLDER}} style and [Placeholder] style from the sample template
+    mapping: Dict[str, str] = {
+        # Curly placeholders
+        "{{COMPANY_NAME}}": org_name,
+        "{{CANDIDATE_NAME}}": request.applicantName,
+        "{{CANDIDATE_FIRST_NAME}}": first_name,
+        "{{ROLE}}": job_role or "the position",
+        "{{START_DATE}}": request.start_date,
+        "{{END_DATE}}": end_formatted,
+        "{{DURATION}}": request.duration,
+        "{{ANNUAL_CTC}}": f"{request.currency} {request.annual_ctc}",
+        "{{PAY_FREQUENCY}}": request.pay_frequency,
+        "{{BENEFITS}}": request.benefits,
+        "{{JOB_ID}}": request.job_id,
+        "{{TODAY_DATE}}": today_str,
+        "{{COMPANY_ADDRESS}}": org_location,
+        "{{COMPANY_PHONE}}": org_phone,
+        "{{COMPANY_WEBSITE}}": org_website,
+        "{{CANDIDATE_EMAIL}}": request.applicantEmail,
+        "{{EMPLOYMENT_TYPE}}": employment,
+        # Bracket-style placeholders used in the provided sample
+        "[COMPANY NAME]": org_name,
+        "[Company Address, City, State – ZIP]": org_location,
+        "[Phone]": org_phone,
+        "[HR Email]": (org_data or {}).get("email", "") or request.orgEmail,
+        "[www.company.com]": org_website,
+        "Ref: job id": f"Ref: {request.job_id}",
+        "[Candidate Full Name]": request.applicantName,
+        "[Candidate Address, City – ZIP]": "",  # fill from candidate profile if available later
+        "[candidate@email.com]": request.applicantEmail,
+        "[Job Title]": job_role or "the position",
+        "[Candidate First Name]": first_name,
+        "[DD Month YYYY]": end_formatted,
+        "[Full-Time / Part-Time / Contract]": employment,
+        "[Office Address / Remote / Hybrid]": org_location,
+        "[e.g., 12 months / Permanent / Probation Period: 3 months]": request.duration,
+        "[e.g., ₹X,XX,XXX per annum / $XX,XXX per year]": f"{request.currency} {request.annual_ctc} per annum",
+        "[Monthly / Bi-weekly / Weekly]": request.pay_frequency,
+        "[Health Insurance, PF, Gratuity, ESOPs, etc.]": request.benefits,
+        "[Acceptance Deadline Date]": "",  # can be computed from start_date if needed
+        "[Company Name]": org_name,
+        "[HR Phone Number]": org_phone,
+        "[DD/MM/YYYY]": "",  # acceptance signature date left blank
+    }
+
+    def replace_in_paragraph(paragraph):
+        for key, val in mapping.items():
+            if key in paragraph.text:
+                paragraph.text = paragraph.text.replace(key, val)
+
+    # Replace placeholders in body paragraphs
+    for paragraph in doc.paragraphs:
+        replace_in_paragraph(paragraph)
+    # Replace placeholders in tables (e.g. footer with [Company Name], [HR Phone Number])
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    replace_in_paragraph(paragraph)
+
+    # Try to insert company logo at top if we have a logo_path
+    logo_path = (org_data or {}).get("logo_path") if org_data else None
+    if logo_path:
+        logo_path = str(logo_path).strip()
+        logo_local: Optional[str] = None
+        try:
+            if is_s3_url(logo_path):
+                logo_local = _local_path_or_download_s3(static_dir, logo_path)
+            else:
+                logo_local = logo_path
+        except Exception as e:
+            print(f"⚠️ Failed to download logo for offer template: {e}")
+            logo_local = None
+
+        if logo_local:
+            try:
+                # Insert logo as a centered image at the very top of the first page
+                if doc.paragraphs:
+                    first_para = doc.paragraphs[0]
+                    logo_para = first_para.insert_paragraph_before()
+                else:
+                    logo_para = doc.add_paragraph()
+                logo_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = logo_para.add_run()
+                run.add_picture(logo_local, width=Inches(1.5))
+            except Exception as e:
+                print(f"⚠️ Adding logo to offer template failed: {e}")
+
+    tmp_dir = Path(tempfile.gettempdir())
+    out_path = tmp_dir / f"offer_{request.job_id}_{uuid.uuid4().hex}.docx"
+    doc.save(str(out_path))
+    return out_path
+
+
+def _convert_docx_to_pdf_safe(docx_path: Path) -> Path:
+    """
+    Convert DOCX to PDF using docx2pdf.
+    If conversion fails, fall back to returning the DOCX path (caller can still send DOCX).
+    """
+    try:
+        pdf_path = docx_path.with_suffix(".pdf")
+        docx2pdf_convert(str(docx_path), str(pdf_path))
+        if pdf_path.exists():
+            return pdf_path
+    except Exception as e:
+        print(f"⚠️ DOCX->PDF conversion failed, sending DOCX instead: {e}")
+    return docx_path
+
+
+@app.post("/api/send-offer-letter-auto")
+async def send_offer_letter_auto(
+    request: AutoOfferRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Generate offer letter from Offer_Letter_Template.docx, upload (PDF/DOCX) to S3, and send email.
+    Mirrors send_offer_letter but does not require manual file upload.
+    """
+    try:
+        if current_user.get("user_type") != "organization":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Only organizations can access this endpoint"
+            )
+
+        # Resolve template path: env OFFER_LETTER_TEMPLATE_PATH, else repo root, else backend/static/templates
+        template_path = None
+        env_path = os.getenv("OFFER_LETTER_TEMPLATE_PATH", "").strip()
+        if env_path:
+            p = Path(env_path)
+            if not p.is_absolute():
+                p = backend_dir / p
+            if p.exists():
+                template_path = p
+        if template_path is None:
+            template_path = backend_dir.parent / "Offer_Letter_Template.docx"
+        if not template_path.exists():
+            template_path = backend_dir / "static" / "templates" / "Offer_Letter_Template.docx"
+        if not template_path.exists():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Offer letter template not found. Set OFFER_LETTER_TEMPLATE_PATH or place Offer_Letter_Template.docx in project root or backend/static/templates/"
+            )
+
+        # Get job role from open, ongoing, or closed jobs
+        job_details = await open_jobs_collection.find_one({"job_id": request.job_id})
+        if job_details is None:
+            job_details = await ongoing_jobs_collection.find_one({"job_id": request.job_id})
+        if job_details is None:
+            job_details = await closed_jobs_collection.find_one({"job_id": request.job_id})
+        job_role = job_details.get("role", "the position") if job_details else "the position"
+
+        # Map job_type to a human-friendly employment type, if available
+        employment_type = ""
+        job_type_raw = (job_details or {}).get("job_type", "")
+        if job_type_raw:
+            jt = str(job_type_raw).lower()
+            if jt == "full_time":
+                employment_type = "Full-Time"
+            elif jt == "part_time":
+                employment_type = "Part-Time"
+            elif jt in ("contract", "contractor"):
+                employment_type = "Contract"
+            elif jt == "internship":
+                employment_type = "Internship"
+            else:
+                employment_type = job_type_raw
+
+        # Get organization profile data for address/phone/website/logo, if available
+        org_data = await organization_data_collection.find_one({"email": request.orgEmail})
+
+        # 1) Build DOCX from template
+        docx_path = _build_offer_docx_from_template(
+            template_path,
+            request,
+            job_role,
+            org_data=org_data,
+            employment_type=employment_type,
+        )
+
+        # 2) Convert DOCX -> PDF (best-effort)
+        final_path = _convert_docx_to_pdf_safe(docx_path)
+        ext = final_path.suffix.lower() or ".docx"
+        content_type = "application/pdf" if ext == ".pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+        # 3) Upload file to S3 (offers/)
+        with open(final_path, "rb") as f:
+            file_bytes = f.read()
+        try:
+            file_path = upload_bytes_to_s3(
+                file_bytes,
+                key_prefix="offers",
+                file_extension=ext,
+                content_type=content_type,
+            )
+        except ValueError as e:
+            print(f"❌ S3 not configured: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="File storage (S3) is not configured. Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME and AWS_REGION in .env."
+            )
+
+        # 4) Create webhook ID for offer response
+        webhook_id = str(uuid.uuid4())
+        frontend_url = get_frontend_base_url()
+        form_link = f"{frontend_url}/offer-response?offer_id={webhook_id}"
+
+        # Store offer webhook
+        await offer_webhook_collection.insert_one({
+            "webhook_id": webhook_id,
+            "applicantEmail": request.applicantEmail,
+            "applicantName": request.applicantName,
+            "orgEmail": request.orgEmail,
+            "orgName": request.orgName,
+            "job_id": request.job_id,
+            "offer_letter_path": file_path,
+            "status": "pending",
+            "created_at": datetime.utcnow()
+        })
+
+        # Update status to offer_sent
+        await job_applied_collection.update_one(
+            {"job_id": request.job_id, "email": request.applicantEmail},
+            {
+                "$set": {
+                    "status": "offer_sent",
+                    "updated_at": datetime.utcnow()
+                }
+            }
+        )
+
+        # Update status in job collections
+        for collection in [open_jobs_collection, ongoing_jobs_collection, closed_jobs_collection]:
+            await collection.update_one(
+                {
+                    "job_id": request.job_id,
+                    "applied_candidates.email": request.applicantEmail
+                },
+                {
+                    "$set": {
+                        "applied_candidates.$.status": "offer_sent",
+                        "applied_candidates.$.updated_at": datetime.utcnow()
+                    }
+                }
+            )
+
+        # 5) Send email with offer letter attachment
+        from services.email_service import send_offer_letter_email
+        offer_local_path = _local_path_or_download_s3(static_dir, file_path)
+        try:
+            success = await send_offer_letter_email(
+                applicant_email=request.applicantEmail,
+                applicant_name=request.applicantName,
+                org_name=request.orgName,
+                job_role=job_role,
+                offer_letter_path=offer_local_path or "",
+                form_link=form_link
+            )
+        finally:
+            if offer_local_path and is_s3_url(file_path) and offer_local_path.startswith(tempfile.gettempdir() or "/tmp"):
+                try:
+                    os.unlink(offer_local_path)
+                except Exception:
+                    pass
+
+        return {
+            "success": True,
+            "message": "Offer letter sent successfully" if success else "Offer letter created, but email sending failed",
+            "webhook_id": webhook_id,
+            "email_sent": success
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error sending auto offer letter: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error sending offer letter: {str(e)}"
