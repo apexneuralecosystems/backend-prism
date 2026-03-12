@@ -908,6 +908,7 @@ async def verify_otp_and_create_user(data: dict = Body(...)):
                 "about_company": "",
                 "linkedin_link": "",
                 "instagram_link": "",
+                "external_webhook_url": "",
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow()
             }
@@ -1513,7 +1514,8 @@ async def get_organization_profile(current_user: dict = Depends(get_current_user
                     "location": "",
                     "about_company": "",
                     "linkedin_link": "",
-                    "instagram_link": ""
+                    "instagram_link": "",
+                    "external_webhook_url": ""
                 }
             }
         
@@ -1863,47 +1865,12 @@ async def salesforce_status(current_user: dict = Depends(get_current_user)):
     return {"connected": connected}
 
 
-@app.post("/api/organization-jobpost/{job_id}/push-salesforce")
-async def push_job_to_salesforce(
-    job_id: str,
-    dry_run: bool = False,
-    current_user: dict = Depends(get_current_user),
-):
+async def _build_job_integration_payload(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Push a job's full data (including all candidate details) to Salesforce
-    as a PRISM_Jobs__c record. Creates the custom object/field if absent.
-    Only org members can call; owner must have connected Salesforce.
+    Build the canonical job payload used for external integrations
+    (Salesforce, JSON download, and external webhooks).
     """
-    if current_user.get("user_type") != "organization":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can push to Salesforce")
-
-    org_email = get_org_email(current_user)
-    cred = get_salesforce_credential(org_email)
-    if not cred or not cred.get("access_token"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Salesforce not connected. Please connect Salesforce in your Organization Profile first.",
-        )
-
-    # Search across all job collections (closed first, then ongoing, then open)
-    job = await closed_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
-    job_collection_name = "closed-jobs"
-    if not job:
-        job = await ongoing_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
-        job_collection_name = "ongoing-jobs"
-    if not job:
-        job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
-        job_collection_name = "open-jobs"
-    if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    # If already pushed, we will UPDATE the existing Salesforce record with fresh data
-    # (handles the case where first push created an empty record due to propagation lag,
-    # and also keeps Salesforce records up-to-date when re-pushed)
-    existing_record_id = job.get("salesforce_record_id") if job.get("salesforce_pushed") else None
-
-    # Gather full candidate data
-    applied_candidates_payload = []
+    applied_candidates_payload: list[Dict[str, Any]] = []
     for candidate in job.get("applied_candidates") or []:
         candidate_email = candidate.get("email")
 
@@ -1995,6 +1962,51 @@ async def push_job_to_salesforce(
         "applied_candidates": applied_candidates_payload,
     }
 
+    return job_payload
+
+
+@app.post("/api/organization-jobpost/{job_id}/push-salesforce")
+async def push_job_to_salesforce(
+    job_id: str,
+    dry_run: bool = False,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Push a job's full data (including all candidate details) to Salesforce
+    as a PRISM_Jobs__c record. Creates the custom object/field if absent.
+    Only org members can call; owner must have connected Salesforce.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can push to Salesforce")
+
+    org_email = get_org_email(current_user)
+    cred = get_salesforce_credential(org_email)
+    if not cred or not cred.get("access_token"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Salesforce not connected. Please connect Salesforce in your Organization Profile first.",
+        )
+
+    # Search across all job collections (closed first, then ongoing, then open)
+    job = await closed_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    job_collection_name = "closed-jobs"
+    if not job:
+        job = await ongoing_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+        job_collection_name = "ongoing-jobs"
+    if not job:
+        job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+        job_collection_name = "open-jobs"
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # If already pushed, we will UPDATE the existing Salesforce record with fresh data
+    # (handles the case where first push created an empty record due to propagation lag,
+    # and also keeps Salesforce records up-to-date when re-pushed)
+    existing_record_id = job.get("salesforce_record_id") if job.get("salesforce_pushed") else None
+
+    # Gather full candidate data and build canonical payload
+    job_payload = await _build_job_integration_payload(job_id, job)
+
     record_name = f"{job.get('role', 'Unknown Role')} ({job_id})"
 
     # Allow frontend to download the exact payload without pushing to Salesforce
@@ -2066,6 +2078,73 @@ async def push_job_to_salesforce(
         "message": f"Job data {action} in Salesforce successfully",
         "record_id": result.get("record_id"),
         "already_pushed": bool(existing_record_id),
+    }
+
+
+@app.post("/api/organization-jobpost/{job_id}/trigger-webhook")
+async def trigger_job_webhook(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Trigger external webhook with the same job payload used for Salesforce/JSON download.
+    Sends POST <external_webhook_url> with JSON body.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only organizations can trigger webhooks")
+
+    org_email = get_org_email(current_user)
+    org_data = await organization_data_collection.find_one({"email": org_email})
+    webhook_url = (org_data or {}).get("external_webhook_url") if org_data else None
+    if not webhook_url or not isinstance(webhook_url, str) or not webhook_url.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Webhook not configured. Please add a Webhook URL in your Organization Profile.",
+        )
+
+    webhook_url = webhook_url.strip()
+
+    # Search across all job collections (closed first, then ongoing, then open)
+    job = await closed_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        job = await ongoing_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    job_payload = await _build_job_integration_payload(job_id, job)
+
+    # Ensure payload is fully JSON-serializable (convert datetimes, etc. to strings)
+    try:
+        safe_payload = json.loads(json.dumps(job_payload, default=str))
+    except Exception as e:
+        print(f"❌ Failed to serialize webhook payload for job {job_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to serialize job data for webhook.",
+        )
+
+    try:
+        resp = requests.post(webhook_url, json=safe_payload, timeout=10)
+    except Exception as e:
+        print(f"❌ Error calling external webhook for job {job_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Error calling external webhook. Please verify the URL and try again.",
+        )
+
+    if not (200 <= resp.status_code < 300):
+        print(f"❌ Webhook call failed for job {job_id}: status={resp.status_code}, body={resp.text[:500]}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Webhook endpoint returned HTTP {resp.status_code}.",
+        )
+
+    return {
+        "success": True,
+        "message": "Webhook triggered successfully",
+        "status_code": resp.status_code,
     }
 
 
