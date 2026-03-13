@@ -3290,6 +3290,28 @@ async def get_payment_history(
 
 # ==================== ORGANIZATION JOB POSTING ENDPOINTS ====================
 
+# Applicant intake limit pricing (job credits -> max candidates)
+# Model: 50 applicants consume 1 job credit (rounded up).
+DEFAULT_APPLICANT_LIMIT = 50
+
+
+def get_applicant_limit_credits(limit: int) -> int:
+    """
+    Map an applicant limit to the number of job credits required.
+    Current model: 50 applicants = 1 credit (ceil).
+    """
+    try:
+        limit_int = int(limit or 0)
+    except Exception:
+        limit_int = DEFAULT_APPLICANT_LIMIT
+
+    if limit_int <= 0:
+        limit_int = DEFAULT_APPLICANT_LIMIT
+
+    # 50 applicants per credit, rounded up
+    return (limit_int + 49) // 50
+
+
 class JobPostData(BaseModel):
     role: str
     location: str
@@ -3310,6 +3332,7 @@ async def create_job_post(
     job_package_lpa: Optional[float] = Form(None),  # legacy single value; used if min/max not provided
     job_type: str = Form(...),
     notes: Optional[str] = Form(""),
+    applicant_limit: Optional[int] = Form(None),
     jd_file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
@@ -3336,10 +3359,16 @@ async def create_job_post(
             )
         
         current_credits = org_owner.get("credits", 0)
-        if current_credits < 1:
+
+        # Resolve applicant_limit and required credits (defaults to 50 -> 1 credit)
+        if applicant_limit is None or applicant_limit <= 0:
+            applicant_limit = DEFAULT_APPLICANT_LIMIT
+        credits_required = get_applicant_limit_credits(applicant_limit)
+
+        if current_credits < credits_required:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Insufficient credits. Please purchase credits to post a job."
+                detail=f"Insufficient credits. Required {credits_required} credit(s) for this applicant limit, but you have {current_credits}. Please purchase more credits to post this job."
             )
 
         # Get organization data for company info
@@ -3442,6 +3471,7 @@ async def create_job_post(
             "job_type": job_type,
             "notes": notes,
             "applied_candidates": [],
+            "applicant_limit": applicant_limit,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         }
@@ -3449,8 +3479,8 @@ async def create_job_post(
         # Save to open-jobs collection
         result = await open_jobs_collection.insert_one(job_doc)
 
-        # Deduct 1 credit after successful job creation
-        new_credits = current_credits - 1
+        # Deduct credits after successful job creation (based on applicant_limit tier)
+        new_credits = current_credits - credits_required
         await users_collection.update_one(
             {"email": org_email},
             {
@@ -3542,6 +3572,144 @@ async def get_organization_jobs(current_user: dict = Depends(get_current_user)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+
+
+@app.patch("/api/organization-jobpost/{job_id}/update-date")
+async def update_job_application_date(
+    job_id: str,
+    application_close_date: str = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Update application close date for an open job (org-only).
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only organizations can update job dates",
+        )
+
+    org_email = get_org_email(current_user)
+
+    # Only allow changing date on open jobs for this org
+    job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found or not open",
+        )
+
+    # Optional: validate date string format here if needed
+    await open_jobs_collection.update_one(
+        {"job_id": job_id, "company.email": org_email},
+        {
+            "$set": {
+                "application_close_date": application_close_date,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+
+    return {"success": True, "message": "Application close date updated"}
+
+
+@app.post("/api/organization-jobpost/{job_id}/increase-limit")
+async def increase_job_applicant_limit(
+    job_id: str,
+    new_applicant_limit: int = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Increase applicant intake limit for an open job.
+    Deducts extra job credits according to get_applicant_limit_credits.
+    """
+    if current_user.get("user_type") != "organization":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only organizations can modify applicant limits",
+        )
+
+    if new_applicant_limit <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New applicant limit must be positive",
+        )
+
+    org_email = get_org_email(current_user)
+
+    job = await open_jobs_collection.find_one({"job_id": job_id, "company.email": org_email})
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found or not open",
+        )
+
+    # Current applicants and current limit
+    current_count = len(job.get("applied_candidates") or [])
+    current_limit = job.get("applicant_limit") or DEFAULT_APPLICANT_LIMIT
+
+    if new_applicant_limit <= current_limit:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New limit must be greater than current limit",
+        )
+
+    if new_applicant_limit < current_count:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New limit cannot be less than current applicant count",
+        )
+
+    # Credits: only pay for the extra capacity
+    org_owner = await users_collection.find_one({"email": org_email})
+    if not org_owner:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found",
+        )
+
+    current_credits = org_owner.get("credits", 0)
+    old_required = get_applicant_limit_credits(current_limit)
+    new_required = get_applicant_limit_credits(new_applicant_limit)
+    extra_required = max(0, new_required - old_required)
+
+    if extra_required > 0 and current_credits < extra_required:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Insufficient credits. Need {extra_required} additional credit(s) "
+                f"to increase the intake limit, but you have {current_credits}."
+            ),
+        )
+
+    # Deduct extra credits
+    if extra_required > 0:
+        await users_collection.update_one(
+            {"email": org_email},
+            {
+                "$set": {
+                    "credits": current_credits - extra_required,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+
+    # Update job with new limit
+    await open_jobs_collection.update_one(
+        {"job_id": job_id, "company.email": org_email},
+        {
+            "$set": {
+                "applicant_limit": new_applicant_limit,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+
+    return {
+        "success": True,
+        "message": "Applicant intake limit increased",
+        "new_applicant_limit": new_applicant_limit,
+    }
 
 
 @app.put("/api/organization-jobpost/{job_id}/close")
@@ -4070,6 +4238,16 @@ async def apply_for_job(
                 detail="Job not found"
             )
 
+        # Enforce applicant intake limit (if configured) before heavy processing
+        applicant_limit = job_details.get("applicant_limit")
+        if isinstance(applicant_limit, int) and applicant_limit > 0:
+            current_count = len(job_details.get("applied_candidates") or [])
+            if current_count >= applicant_limit:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Applicant intake limit reached for this job. Please wait until the company increases the limit or contact the HR team."
+                )
+
         # Get user profile for resume URL
         user_profile = await user_data_collection.find_one({"user_email": current_user["email"]})
         resume_url = application_data.get("resume_url", "")
@@ -4369,9 +4547,17 @@ async def get_public_job(job_id: str):
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found"
             )
-        # Return a copy without applied_candidates (do not expose applicant data)
+        # Compute applicant intake status without exposing individual applicants
         job = dict(job)
         job["_id"] = str(job["_id"])
+        applicant_limit = job.get("applicant_limit")
+        applicant_count = len(job.get("applied_candidates") or [])
+        job["applicant_limit"] = applicant_limit
+        job["applicant_count"] = applicant_count
+        job["intake_limit_reached"] = bool(
+            isinstance(applicant_limit, int) and applicant_limit > 0 and applicant_count >= applicant_limit
+        )
+        # Do not expose applied_candidates list in public endpoint
         job.pop("applied_candidates", None)
         return {"success": True, "job": job}
     except HTTPException:
